@@ -1,4 +1,4 @@
-use rodio::{Decoder, MixerDeviceSink};
+use rodio::{Decoder, MixerDeviceSink, queue};
 use std::fs::File;
 use std::io;
 use std::io::BufReader;
@@ -34,16 +34,12 @@ impl Queue {
         }
         // self.player.append(self.current_track.source);
     }
-    fn handle_event(&mut self, event: i16) {
-        match event {
-            1 => self.play(),
-            2 => {
+    fn handle_event(&mut self, payload: EventPayload) {
+        match payload {
+            EventPayload::PlaySong { id } => self.play(),
+            EventPayload::ChangeVolume { value } => {
                 self.player
-                    .set_volume((self.player.volume() + 0.05).min(1.0).max(0.0));
-            }
-            3 => {
-                self.player
-                    .set_volume((self.player.volume() - 0.05).min(1.0).max(0.0));
+                    .set_volume((self.player.volume() + value).min(1.0).max(0.0));
             }
 
             _ => {}
@@ -67,6 +63,37 @@ impl Track {
         })
     }
 }
+
+struct Event {
+    queue_event: bool,
+    payload: EventPayload,
+    // id time etc
+}
+impl Event {
+    fn from_input(input: i32) -> Self {
+        let (queue_event, payload) = match input {
+            0 => (false, EventPayload::Exit),
+            1 => (true, EventPayload::PlaySong { id: 123 }),
+            2 => (true, EventPayload::NextSong { next: true }),
+            3 => (true, EventPayload::ChangeVolume { value: 0.05 }),
+            4 => (true, EventPayload::ChangeVolume { value: -0.05 }),
+            _ => (false, EventPayload::None),
+        };
+        Self {
+            queue_event,
+            payload,
+        }
+    }
+}
+
+enum EventPayload {
+    Pause,
+    ChangeVolume { value: f32 },
+    NextSong { next: bool },
+    PlaySong { id: i32 },
+    Exit,
+    None, // temp ig
+}
 struct State {
     queue: Queue,
     paused: bool,
@@ -77,12 +104,11 @@ impl State {
         let paused = false;
         Self { queue, paused }
     }
-    fn handle_event(&mut self, event: i16) -> bool {
-        match event {
-            0 => println!("its a zero"), // debug
-            1..10 => self.queue.handle_event(event),
-            10 => return false,
-            _ => {}
+    fn handle_event(&mut self, event: Event) -> bool {
+        match (&event.queue_event, &event.payload) {
+            (true, _) => self.queue.handle_event(event.payload),
+            (false, EventPayload::Exit) => return false,
+            (_, _) => {}
         }
         true
     }
@@ -101,8 +127,9 @@ impl App {
             io::stdin()
                 .read_line(&mut input)
                 .expect("Failed to read line");
-            let input = input.trim().parse::<i16>().unwrap_or(0);
-            if !self.state.handle_event(input) {
+            let input = input.trim().parse::<i32>().unwrap_or(0);
+            let event = Event::from_input(input);
+            if !self.state.handle_event(event) {
                 break;
             }
         }
