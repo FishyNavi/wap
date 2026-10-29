@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 rodio = "0.23.0"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
