@@ -1,6 +1,12 @@
+use lofty::file::AudioFile;
+use lofty::file::TaggedFileExt;
+use lofty::read_from_path;
+use lofty::tag;
+use lofty::tag::Accessor;
 use rodio::{Decoder, MixerDeviceSink, queue};
 use rusqlite::Connection;
 use rusqlite::params;
+use std::borrow::Cow;
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
@@ -90,7 +96,17 @@ impl Resources {
     }
     fn index(&mut self, dir: &Path) -> Result<(), Box<dyn Error>> {
         self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS db (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL)", [],
+            "
+            CREATE TABLE IF NOT EXISTS db (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL,
+                title TEXT,
+                artist TEXT,
+                album TEXT,
+                genre TEXT
+            )
+            ",
+            [],
         )?;
 
         self.check_dir(dir)?;
@@ -105,21 +121,55 @@ impl Resources {
             Ok(Track {
                 id: row.get(0)?,
                 path: row.get(1)?,
-                bias: None,
+                tags: None,
             })
         })?;
         for song in song_iter {
-            println!("Found song {:?}", song?)
+            let song = song?;
+            println!("Found song {:?}", song);
+            let path: String = song.path;
+
+            match read_from_path(&path) {
+                Ok(tagged_file) => {
+                    // for item in tagged_file.primary_tag().unwrap().items() {
+                    //     println!("{:?}", item)
+                    // }
+                    let duration = tagged_file.properties().duration();
+                    let bitrate = tagged_file.properties().audio_bitrate();
+                    if let Some(tag) = tagged_file.primary_tag() {
+                        let title = tag
+                            .title()
+                            .unwrap_or_else(|| Cow::Borrowed("Unknown Title"));
+                        let artist = tag
+                            .artist()
+                            .unwrap_or_else(|| Cow::Borrowed("Unknown Artist"));
+                        let album = tag
+                            .album()
+                            .unwrap_or_else(|| Cow::Borrowed("Unknown Album"));
+                        let genre = tag
+                            .genre()
+                            .unwrap_or_else(|| Cow::Borrowed("Unknown Genre"));
+                        self.conn.execute(
+                            "UPDATE db SET title = ?1, artist = ?2, album = ?3, genre = ?4 WHERE path = ?5 ",
+                            params![title, artist, album, genre, &path],
+                        )?;
+                        // TODO: add more tags
+
+                        // println!("{} {} {} {}", title, artist, album, genre)
+                    }
+                }
+                Err(e) => {}
+            }
         }
 
         Ok(())
     }
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Track {
     id: i32,
     path: String,
-    bias: Option<f32>,
+    tags: Option<i32>,
 }
 struct TrackData {
     name: String,
