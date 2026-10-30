@@ -3,41 +3,46 @@ use lofty::file::TaggedFileExt;
 use lofty::read_from_path;
 use lofty::tag;
 use lofty::tag::Accessor;
+use lofty::tag::Tag;
 use rodio::{Decoder, MixerDeviceSink, queue};
 use rusqlite::Connection;
 use rusqlite::params;
 use std::borrow::Cow;
+
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::BufReader;
+
+use std::path;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 struct Queue {
-    queue: Arc<RwLock<Vec<i16>>>,
+    queue: Arc<Vec<Track>>,
     sink_handle: MixerDeviceSink,
-    songs: Vec<Track>,
+    track_list: Vec<TrackData>,
     player: rodio::Player,
-    current_track: TrackData,
-    next_track: Option<TrackData>,
-    previous_track: Option<TrackData>,
+    current_track: Option<Track>,
+    next_track: Option<Track>,
+    previous_track: Option<Track>,
 }
 impl Queue {
     fn new() -> Self {
-        let current_track = TrackData::new(1).unwrap();
-        let queue: Arc<RwLock<Vec<i16>>> = Arc::new(RwLock::new(Vec::new()));
+        // let current_track = Track::new(1, None).unwrap();
+        let current_track = None;
+        let queue: Arc<Vec<Track>> = Arc::new(Vec::new());
 
         let sink_handle =
             rodio::DeviceSinkBuilder::open_default_sink().expect("open default audio stream");
         let player = rodio::Player::connect_new(&sink_handle.mixer());
-        let songs: Vec<Track> = vec![];
+        let track_list: Vec<TrackData> = vec![];
         Self {
             queue,
             sink_handle,
-            songs,
+            track_list,
             player,
             current_track,
             next_track: None,
@@ -45,12 +50,17 @@ impl Queue {
         }
     }
     fn play(&mut self) {
-        if let Some(source) = self.current_track.source.take() {
-            self.player.append(source);
+        if let Some(track) = self.current_track.as_mut() {
+            if let Some(source) = track.source.take() {
+                self.player.append(source);
+            }
         }
         // self.player.append(self.current_track.source);
     }
     fn handle_event(&mut self, payload: EventPayload) {
+        if self.current_track.is_none() {
+            return;
+        };
         match payload {
             EventPayload::PlaySong { id } => self.play(),
             EventPayload::ChangeVolume { value } => {
@@ -62,6 +72,10 @@ impl Queue {
 
             _ => {}
         }
+    }
+    fn set_track_list(&mut self, track_list: Vec<TrackData>) {
+        self.track_list = track_list;
+        println!("{:?}", self.track_list);
     }
 }
 struct Resources {
@@ -118,10 +132,10 @@ impl Resources {
     fn parse_db(&mut self) -> rusqlite::Result<()> {
         let mut stmt = self.conn.prepare("SELECT id, path FROM db")?;
         let song_iter = stmt.query_map([], |row| {
-            Ok(Track {
+            Ok(TrackData {
                 id: row.get(0)?,
                 path: row.get(1)?,
-                tags: None,
+                tag: None,
             })
         })?;
         for song in song_iter {
@@ -164,29 +178,84 @@ impl Resources {
 
         Ok(())
     }
+    fn fetch_db(&mut self) -> Result<Vec<TrackData>, Box<dyn Error>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, path, title, artist, album, genre FROM db")?;
+        let tags: Result<Vec<TrackData>, rusqlite::Error> = stmt
+            .query_map([], |row| {
+                Ok({
+                    TrackData {
+                        id: row.get(0)?,
+                        path: row.get(1)?,
+                        tag: Some(TrackTag {
+                            title: row.get(2)?,
+                            artist: row.get(3)?,
+                            album: row.get(4)?,
+                            genre: row.get(5)?,
+                        }),
+                    }
+                })
+            })
+            .expect("No tag")
+            .collect();
+        Ok(tags?)
+    }
 }
 #[derive(Debug, Clone)]
-struct Track {
+struct TrackTag {
+    title: String,
+    artist: String,
+    album: String,
+    genre: String,
+}
+impl TrackTag {
+    fn new(title: String, artist: String, album: String, genre: String) -> Self {
+        Self {
+            title,
+            artist,
+            album,
+            genre,
+        }
+    }
+}
+#[derive(Debug)]
+struct TrackData {
     id: i32,
     path: String,
-    tags: Option<i32>,
+    tag: Option<TrackTag>,
 }
-struct TrackData {
-    name: String,
+struct Track {
     source: Option<Decoder<BufReader<File>>>,
+    data: Option<TrackData>,
     id: i16,
 }
-impl TrackData {
-    fn new(id: i16) -> Option<TrackData> {
-        let name = "test".to_string();
-        let path = "song.mp3";
-        let source = Some(Decoder::try_from(File::open(path).unwrap()).unwrap());
+impl Track {
+    fn new(id: i16, data: TrackData) -> Option<Track> {
+        let source = Some(Decoder::try_from(File::open(data.path).unwrap()).unwrap());
         Some(Self {
-            name: name,
             source,
             id,
+            data: None,
         })
     }
+    // fn fetch_tag_from_db(id: i32, conn: &Connection) -> TrackTag {
+    //     let track_tag = conn.query_row(
+    //         "
+    //             SELECT title, artist, album, genre FROM db WHERE id = ?1
+    //         ",
+    //         [id],
+    //         |row| {
+    //             Ok(TrackTag {
+    //                 title: row.get(0)?,
+    //                 artist: row.get(1)?,
+    //                 album: row.get(2)?,
+    //                 genre: row.get(3)?,
+    //             })
+    //         },
+    //     );
+    //     track_tag.expect("No tag")
+    // }
 }
 
 struct Event {
@@ -232,7 +301,8 @@ impl State {
         let queue = Queue::new();
         let mut resources = Resources::new();
         let e = resources.index(Path::new("."));
-        eprintln!("{:?}", e);
+        // eprintln!("{:?}", e);
+
         let paused = false;
         Self {
             queue,
@@ -248,6 +318,11 @@ impl State {
         }
         true
     }
+    fn load_tracks(&mut self) -> Result<(), Box<dyn Error>> {
+        let tracks = self.resources.fetch_db()?;
+        self.queue.set_track_list(tracks);
+        Ok(())
+    }
 }
 struct App {
     state: State,
@@ -255,9 +330,11 @@ struct App {
 impl App {
     fn new() -> Self {
         let state = State::new();
+
         Self { state }
     }
-    fn run(&mut self) {
+    fn run(&mut self) -> Result<(), Box<dyn Error>> {
+        self.state.load_tracks()?;
         loop {
             let mut input = String::new();
             io::stdin()
@@ -269,6 +346,7 @@ impl App {
                 break;
             }
         }
+        Ok(())
     }
 }
 fn main() {
