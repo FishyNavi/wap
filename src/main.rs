@@ -19,7 +19,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 struct Queue {
-    queue: Arc<Vec<Track>>,
+    queue: Arc<Vec<i32>>,
+    position: Option<usize>,
     sink_handle: MixerDeviceSink,
     track_list: HashMap<i32, TrackData>,
     player: rodio::Player,
@@ -31,7 +32,8 @@ impl Queue {
     fn new() -> Self {
         // let current_track = Track::new(1, None).unwrap();
         let current_track = None;
-        let queue: Arc<Vec<Track>> = Arc::new(Vec::new());
+        let queue: Arc<Vec<i32>> = Arc::new(Vec::new());
+        let position = Some(0);
 
         let sink_handle =
             rodio::DeviceSinkBuilder::open_default_sink().expect("open default audio stream");
@@ -39,6 +41,7 @@ impl Queue {
         let track_list: HashMap<i32, TrackData> = HashMap::new();
         Self {
             queue,
+            position,
             sink_handle,
             track_list,
             player,
@@ -46,6 +49,9 @@ impl Queue {
             next_track: None,
             previous_track: None,
         }
+    }
+    fn enqueue(&mut self, id: i32) -> Result<(), Box<dyn Error>> {
+        Ok(())
     }
     fn play(&mut self, id: i32) -> Result<(), Box<dyn Error>> {
         // if let Some(track) = self.current_track.as_mut() {
@@ -120,6 +126,24 @@ impl Queue {
     // fn queue_track(track: ) {
 
     // }
+    fn next_song(&mut self, forward: bool) -> Result<(), Box<dyn Error>> {
+        let next = self.position.map_or(0, |p| p + 1);
+        if let Some(&id) = self.queue.get(next) {
+            self.position = Some(next);
+            self.play(id)
+        } else {
+            Ok(())
+        }
+
+        // self.previous_track = self.current_track.take();
+        // self.current_track = self.next_track.take();
+        // let track = self.queue.get(self.position as usize).unwrap_or(&Track {
+        //     source: None,
+        //     data: None,
+        //     id: 0,
+        // });
+        // self.next_track = Some(self.track_from_id(track.id + 1)?);
+    }
 }
 struct Resources {
     conn: Connection,
@@ -385,6 +409,13 @@ impl State {
         let tracks = self.resources.fetch_db()?;
         self.queue.set_track_list(tracks);
         Ok(())
+    }
+    fn update(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.queue.player.len() < 2 {
+            self.queue.next_song(true)
+        } else {
+            Ok(())
+        }
     }
 }
 struct App {
