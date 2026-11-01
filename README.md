@@ -1,7 +1,7 @@
 # WAP
 
 ## Overview
-WAP is my personal vision on what an actually usable local music player should look like. WAP is an acronym for Working Audio Player, because well, its an audio player that actually works. 
+WAP is my personal vision on what an actually usable local music player should look like. I have a decent sized music library, but i can't find a player that would have all the features i want. That's why i'm making my own WAP is an acronym for Working Audio Player, because well, its an audio player that actually works.
 
 The main goal is for it to be lightweight, modular, scalable, have a good amount of useful features and of course play music.
 
