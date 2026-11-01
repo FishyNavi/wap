@@ -2,13 +2,11 @@ use lofty::file::AudioFile;
 use lofty::file::TaggedFileExt;
 use lofty::read_from_path;
 use lofty::tag::Accessor;
-use rodio::source;
-use rodio::{Decoder, MixerDeviceSink, queue};
+use rand::seq::SliceRandom;
+use rodio::{Decoder, MixerDeviceSink};
 use rusqlite::Connection;
 use rusqlite::params;
 use std::borrow::Cow;
-
-use rand::seq::SliceRandom;
 use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsStr;
@@ -16,17 +14,17 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::BufReader;
-use std::mem::take;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::{Arc, RwLock};
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 struct Queue {
     queue: Vec<usize>,
     position: Option<usize>,
+    #[allow(unused)]
     sink_handle: MixerDeviceSink,
     track_list: HashMap<usize, TrackData>,
     player: rodio::Player,
@@ -57,17 +55,23 @@ impl Queue {
         self.queue = ids;
         Ok(())
     }
-    fn enqueue_next(&mut self) -> Result<(), Box<dyn Error>> {
+    fn get_next_id(&mut self) -> usize {
+        let previous = self.next_id.unwrap_or(0);
         let next = self.next_id.map_or(0, |p| p + 1);
         self.next_id = Some(next);
 
         if let Some(track) = self.queue.get(next) {
-            self.enqueue(*track)?;
-        };
-
-        Ok(())
+            *track
+        } else {
+            previous
+        }
     }
-    fn enqueue(&mut self, id: usize) -> Result<(), Box<dyn Error>> {
+    fn enqueue(&mut self, id: Option<usize>) -> Result<(), Box<dyn Error>> {
+        let id = if let Some(id) = id {
+            id
+        } else {
+            self.get_next_id()
+        };
         let track_data = self.track_from_id(id)?;
         println!("{}", track_data.path);
         if let Some(source) = TrackData::source_from_path(&track_data.path) {
@@ -134,7 +138,10 @@ impl Queue {
             }
             EventPayload::Pause => self.player.pause(),
             EventPayload::Unpause => self.player.play(),
-
+            EventPayload::Enqueue { id } => self.enqueue(id)?,
+            EventPayload::NextSong => self.next_track()?,
+            EventPayload::PreviousSong => self.previous_track()?,
+            EventPayload::Shuffle => self.shuffle()?,
             _ => {}
         }
         Ok(())
@@ -337,25 +344,36 @@ struct Event {
     // id time etc
 }
 impl Event {
+    fn get_id(buffer: &mut String, stdin: &io::Stdin) -> Option<usize> {
+        buffer.clear();
+        if stdin.read_line(buffer).ok()? == 0 {
+            return None;
+        }
+        let id = buffer.trim().parse::<usize>().unwrap_or_else(|_| {
+            println!("Invalid id");
+            0
+        });
+        Some(id)
+    }
     fn from_input(input: i32, stdin: &io::Stdin, buffer: &mut String) -> Option<Self> {
         let payload = match input {
             0 => EventPayload::Exit,
             1 => {
-                buffer.clear();
-                if stdin.read_line(buffer).ok()? == 0 {
+                let Some(id) = Self::get_id(buffer, stdin) else {
                     return None;
-                }
-                let id = buffer.trim().parse::<usize>().unwrap_or_else(|_| {
-                    println!("Invalid id");
-                    0
-                });
+                };
                 EventPayload::PlaySong { id }
             }
-            2 => EventPayload::NextSong { forward: true },
-            3 => EventPayload::ChangeVolume { value: 0.05 },
-            4 => EventPayload::ChangeVolume { value: -0.05 },
-            5 => EventPayload::Pause,
-            6 => EventPayload::Unpause,
+            2 => EventPayload::Enqueue {
+                id: Self::get_id(buffer, stdin),
+            },
+            3 => EventPayload::NextSong,
+            4 => EventPayload::PreviousSong,
+            5 => EventPayload::ChangeVolume { value: 0.05 },
+            6 => EventPayload::ChangeVolume { value: -0.05 },
+            7 => EventPayload::Pause,
+            8 => EventPayload::Unpause,
+            9 => EventPayload::Shuffle,
             _ => EventPayload::None,
         };
         Some(Self { payload })
@@ -364,10 +382,14 @@ impl Event {
 }
 
 enum EventPayload {
+    Update,
+    Enqueue { id: Option<usize> },
+    Shuffle,
     Pause,
     Unpause,
     ChangeVolume { value: f32 },
-    NextSong { forward: bool },
+    NextSong,
+    PreviousSong,
     PlaySong { id: usize },
     Exit,
     None, // temp ig
@@ -394,6 +416,7 @@ impl State {
     fn handle_event(&mut self, event: Event) -> bool {
         match &event.payload {
             EventPayload::Exit => return false,
+            EventPayload::Update => self.update(),
             _ => self
                 .queue
                 .handle_event(event.payload)
@@ -408,7 +431,9 @@ impl State {
     }
     fn update(&mut self) {
         if self.queue.player.len() < 2 {
-            self.queue.enqueue_next();
+            self.handle_event(Event {
+                payload: EventPayload::Enqueue { id: None },
+            });
         }
     }
 }
@@ -428,7 +453,9 @@ impl App {
             loop {
                 {
                     let mut state = clone.lock().unwrap();
-                    state.update();
+                    state.handle_event(Event {
+                        payload: EventPayload::Update,
+                    });
                 }
                 sleep(Duration::from_secs(1));
             }
@@ -438,7 +465,9 @@ impl App {
         {
             let mut state = self.state.lock().unwrap();
             state.load_tracks()?;
-            state.queue.shuffle()?;
+            state.handle_event(Event {
+                payload: EventPayload::Shuffle,
+            });
         }
         let mut buffer = String::new();
 
