@@ -1,5 +1,7 @@
 use lofty::file::AudioFile;
 use lofty::file::TaggedFileExt;
+use lofty::id3::v2::ChannelType::BackLeft;
+use lofty::mpeg::Emphasis;
 use lofty::read_from_path;
 use lofty::tag::Accessor;
 use rand::seq::SliceRandom;
@@ -8,6 +10,7 @@ use rusqlite::Connection;
 use rusqlite::params;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
@@ -23,18 +26,18 @@ use std::thread::sleep;
 use std::time::Duration;
 struct Queue {
     queue: Vec<usize>,
-    position: Option<usize>,
+    in_player: VecDeque<usize>,
     #[allow(unused)]
     sink_handle: MixerDeviceSink,
     track_list: HashMap<usize, TrackData>,
     player: rodio::Player,
-    next_id: Option<usize>,
+    next_id: usize,
 }
 impl Queue {
     fn new() -> Self {
-        let next_id = None::<usize>;
+        let next_id = 0;
         let queue: Vec<usize> = Vec::new();
-        let position = Some(0);
+        let in_player: VecDeque<usize> = VecDeque::new();
 
         let sink_handle =
             rodio::DeviceSinkBuilder::open_default_sink().expect("open default audio stream");
@@ -42,106 +45,148 @@ impl Queue {
         let track_list: HashMap<usize, TrackData> = HashMap::new();
         Self {
             queue,
-            position,
+            in_player,
             sink_handle,
             track_list,
             player,
             next_id,
         }
     }
-    fn shuffle(&mut self) -> Result<(), Box<dyn Error>> {
+    fn open(&self, track_id: usize) -> Result<Decoder<BufReader<File>>, Box<dyn Error>> {
+        let data = self
+            .track_list
+            .get(&(track_id))
+            .ok_or_else(|| format!("no track with id {track_id}"))?;
+        let file = File::open(&data.path).map_err(|e| format!("{}: {e}", data.path))?;
+        Ok(Decoder::try_from(file)?)
+    }
+    fn get_track_data(&self) -> Result<TrackData, Box<dyn Error>> {
+        Ok(self
+            .track_list
+            .get(self.in_player.front().ok_or("id not found")?)
+            .cloned()
+            .ok_or("not such id")?)
+    }
+    fn position(&self) -> Option<usize> {
+        self.in_player.front().copied()
+    }
+    fn shuffle(&mut self) {
         let mut ids: Vec<usize> = self.track_list.keys().copied().collect();
         ids.shuffle(&mut rand::rng());
         self.queue = ids;
+        self.next_id = self
+            .in_player
+            .back()
+            .and_then(|&t| self.index_of(t))
+            .map_or(0, |i| i + 1);
+    }
+
+    // fn get_next_id(&mut self) -> usize {
+    //     let previous = self.next_id.unwrap_or(0);
+    //     let next = self.next_id.map_or(0, |p| p + 1);
+    //     self.next_id = next;
+
+    //     if let Some(track) = self.queue.get(next) {
+    //         *track
+    //     } else {
+    //         previous
+    //     }
+    // }
+    fn enqueue(&mut self, id: usize) -> Result<(), Box<dyn Error>> {
+        let source = self.open(id)?;
+        self.player.append(source);
+        self.in_player.push_back(id);
+
         Ok(())
     }
-    fn get_next_id(&mut self) -> usize {
-        let previous = self.next_id.unwrap_or(0);
-        let next = self.next_id.map_or(0, |p| p + 1);
-        self.next_id = Some(next);
-
-        if let Some(track) = self.queue.get(next) {
-            *track
-        } else {
-            previous
-        }
+    fn index_of(&self, track_id: usize) -> Option<usize> {
+        self.queue.iter().position(|&t| t == track_id)
     }
-    fn enqueue(&mut self, id: Option<usize>) -> Result<(), Box<dyn Error>> {
-        let id = if let Some(id) = id {
-            id
-        } else {
-            self.get_next_id()
-        };
-        let track_data = self.track_from_id(id)?;
-        println!("{}", track_data.path);
-        if let Some(source) = TrackData::source_from_path(&track_data.path) {
-            self.player.append(source);
-        }
-
-        Ok(())
-    }
-
-    fn play_track(&mut self, id: usize) -> Result<(), Box<dyn Error>> {
-        self.position = Some(id as usize);
-
+    fn play_id(&mut self, track_id: usize) -> Result<(), Box<dyn Error>> {
         // println!(
         //     "{:?} {:?} {:?}",
         //     self.position,
         //     self.player.len(),
         //     self.track_list
         // );
-        let (track_id, path) = {
-            let track_data = self.track_from_id(id)?;
-            (track_data.id, track_data.path.clone())
+        let source = self.open(track_id)?;
+        let id = match self.index_of(track_id) {
+            Some(i) => i,
+            None => {
+                self.queue.push(track_id);
+                self.queue.len() - 1
+            }
         };
-
-        self.next_id = Some(track_id);
-
-        let mut source = TrackData::source_from_path(&path);
-        if let Some(source) = source.take() {
-            self.player.clear();
-            self.player.append(source);
-            self.player.play();
-        }
-
+        self.in_player.clear();
+        self.player.clear();
+        self.next_id = id + 1;
+        self.in_player.push_back(track_id);
+        self.player.append(source);
+        self.player.play();
         Ok(())
     }
-    fn previous_track(&mut self) -> Result<(), Box<dyn Error>> {
-        let next = self
-            .position
-            .map_or(0, |p| if p == 0 { self.queue.len() - 1 } else { p - 1 });
-        if let Some(&id) = self.queue.get(next) {
-            self.position = Some(next);
-            self.play_track(id)
-        } else {
-            Ok(())
+    // fn previous_track(&mut self) -> Result<(), Box<dyn Error>> {
+    //     let next = self
+    //         .position
+    //         .map_or(0, |p| if p == 0 { self.queue.len() - 1 } else { p - 1 });
+    //     if let Some(&id) = self.queue.get(next) {
+    //         self.position = Some(next);
+    //         self.play_id(id)
+    //     } else {
+    //         Ok(())
+    //     }
+    // }
+    // fn previous_track(&mut self) -> Result<(), Box<dyn Error>> {
+    //     let id = match self.position() {
+    //         None | Some(0) => self.queue.len() - 1,
+    //         Some(p) => p - 1,
+    //     };
+    //     self.play_id(id)
+    // }
+    // fn next_track(&mut self) -> Result<(), Box<dyn Error>> {
+    //     if self.queue.is_empty() {
+    //         println!("empty queue");
+    //         return Ok(());
+    //     }
+    //     let id = self.position().map_or(0, |p| p + 1) % self.queue.len();
+
+    //     self.play_id(id)
+    // }
+    fn next_track(&mut self, forward: bool) -> Result<(), Box<dyn Error>> {
+        let len = self.queue.len();
+        if len == 0 {
+            return Err("queue is empty".into());
         }
-    }
-    fn next_track(&mut self) -> Result<(), Box<dyn Error>> {
-        let next = self.position.map_or(0, |p| p + 1);
-        if let Some(&id) = self.queue.get(next) {
-            self.position = Some(next);
-            self.play_track(id)
-        } else {
-            Ok(())
-        }
+        let cur = self
+            .in_player
+            .front()
+            .copied()
+            .and_then(|t| self.index_of(t));
+        let idx = match (cur, forward) {
+            (Some(i), true) => (i + 1) % len,
+            (Some(i), false) => (i + len - 1) % len,
+            (None, true) => 0,
+            (None, false) => len - 1,
+        };
+        self.play_id(self.queue[idx])
     }
     fn handle_event(&mut self, payload: EventPayload) -> Result<(), Box<dyn Error>> {
         // if self.current_track.is_none() {
         //     return;
         // };
         match payload {
-            EventPayload::PlaySong { id } => self.play_track(id)?,
+            EventPayload::PlaySong { id } => self.play_id(id)?,
             EventPayload::ChangeVolume { value } => {
                 self.player
                     .set_volume((self.player.volume() + value).min(1.0).max(0.0));
             }
+            EventPayload::SetVolume { value } => self.player.set_volume(value),
             EventPayload::Pause => self.player.pause(),
             EventPayload::Unpause => self.player.play(),
             EventPayload::Enqueue { id } => self.enqueue(id)?,
-            EventPayload::NextSong => self.next_track()?,
-            EventPayload::PreviousSong => self.previous_track()?,
-            EventPayload::Shuffle => self.shuffle()?,
+            EventPayload::NextSong => self.next_track(true)?,
+            EventPayload::PreviousSong => self.next_track(false)?,
+            EventPayload::Shuffle => self.shuffle(),
             _ => {}
         }
         Ok(())
@@ -149,12 +194,22 @@ impl Queue {
     fn set_track_list(&mut self, track_list: HashMap<usize, TrackData>) {
         self.track_list = track_list;
     }
-    fn track_from_id(&mut self, id: usize) -> Result<&TrackData, &str> {
-        let track_data = self
-            .track_list
-            .get(&id)
-            .ok_or("wap searched hard but didn't find any matching the id");
-        track_data
+    fn update(&mut self) {
+        while self.in_player.len() > self.player.len() {
+            self.in_player.pop_front();
+        }
+        let mut failures = 0;
+        while self.player.len() < 2 && failures < self.queue.len() {
+            if self.next_id >= self.queue.len() {
+                self.next_id = 0;
+            }
+            let track_id = self.queue[self.next_id];
+            self.next_id += 1;
+            if let Err(e) = self.enqueue(track_id) {
+                eprintln!("skipping track {track_id}: {e}");
+                failures += 1;
+            }
+        }
     }
 }
 struct Resources {
@@ -173,7 +228,9 @@ impl Resources {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             if entry.path().is_dir() {
-                Self::check_dir(self, &entry.path())?;
+                if let Err(e) = Self::check_dir(self, &entry.path()) {
+                    println!("{e}");
+                }
             } else {
                 let path = entry.path();
 
@@ -248,7 +305,9 @@ impl Resources {
                         // println!("{} {} {} {}", title, artist, album, genre)
                     }
                 }
-                Err(e) => {}
+                Err(e) => {
+                    eprintln!("{e}, Error reading from path: {path}")
+                }
             }
         }
 
@@ -257,7 +316,7 @@ impl Resources {
     fn fetch_db(&mut self) -> Result<HashMap<usize, TrackData>, Box<dyn Error>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, path, title, artist, album, genre FROM db")?;
+            .prepare("SELECT id, path, COALESCE(title,'Unknown Title'), COALESCE(artist,'Unknown Artist'), COALESCE(album,'Unknown Album'), COALESCE(genre,'Unknown Genre') FROM db")?;
         let tags = stmt
             .query_map([], |row| {
                 let id_: i32 = row.get(0)?;
@@ -275,8 +334,7 @@ impl Resources {
                         }),
                     },
                 ))
-            })
-            .expect("No tag")
+            })?
             .collect::<Result<HashMap<usize, TrackData>, rusqlite::Error>>()?;
         Ok(tags)
     }
@@ -317,9 +375,6 @@ impl TrackData {
             tag: None,
         })
     }
-    fn source_from_path(path: &String) -> Option<Decoder<BufReader<File>>> {
-        Some(Decoder::try_from(File::open(path).unwrap()).unwrap())
-    }
     // fn fetch_tag_from_db(id: usize, conn: &Connection) -> TrackTag {
     //     let track_tag = conn.query_row(
     //         "
@@ -355,42 +410,24 @@ impl Event {
         });
         Some(id)
     }
-    fn from_input(input: i32, stdin: &io::Stdin, buffer: &mut String) -> Option<Self> {
-        let payload = match input {
-            0 => EventPayload::Exit,
-            1 => {
-                let Some(id) = Self::get_id(buffer, stdin) else {
-                    return None;
-                };
-                EventPayload::PlaySong { id }
-            }
-            2 => EventPayload::Enqueue {
-                id: Self::get_id(buffer, stdin),
-            },
-            3 => EventPayload::NextSong,
-            4 => EventPayload::PreviousSong,
-            5 => EventPayload::ChangeVolume { value: 0.05 },
-            6 => EventPayload::ChangeVolume { value: -0.05 },
-            7 => EventPayload::Pause,
-            8 => EventPayload::Unpause,
-            9 => EventPayload::Shuffle,
-            _ => EventPayload::None,
-        };
-        Some(Self { payload })
-        // change it
-    }
 }
-
+enum Response {
+    Empty,
+    Exit,
+    TrackData { data: TrackData },
+}
 enum EventPayload {
     Update,
-    Enqueue { id: Option<usize> },
+    Enqueue { id: usize },
     Shuffle,
     Pause,
     Unpause,
     ChangeVolume { value: f32 },
+    SetVolume { value: f32 },
     NextSong,
     PreviousSong,
     PlaySong { id: usize },
+    GetTrackInfo,
     Exit,
     None, // temp ig
 }
@@ -413,16 +450,19 @@ impl State {
             paused,
         }
     }
-    fn handle_event(&mut self, event: Event) -> bool {
-        match &event.payload {
-            EventPayload::Exit => return false,
-            EventPayload::Update => self.update(),
-            _ => self
-                .queue
-                .handle_event(event.payload)
-                .unwrap_or_else(|e| eprintln!("Error: {}", e)),
+
+    fn handle_event(&mut self, event: Event) -> Result<Response, Box<dyn Error>> {
+        match event.payload {
+            EventPayload::Exit => return Ok(Response::Exit),
+            EventPayload::Update => self.queue.update(),
+            EventPayload::GetTrackInfo => {
+                return Ok(Response::TrackData {
+                    data: self.queue.get_track_data()?,
+                });
+            }
+            other => self.queue.handle_event(other)?,
         }
-        true
+        Ok(Response::Empty)
     }
     fn load_tracks(&mut self) -> Result<(), Box<dyn Error>> {
         let tracks = self.resources.fetch_db()?;
@@ -430,11 +470,7 @@ impl State {
         Ok(())
     }
     fn update(&mut self) {
-        if self.queue.player.len() < 2 {
-            self.handle_event(Event {
-                payload: EventPayload::Enqueue { id: None },
-            });
-        }
+        self.queue.update();
     }
 }
 struct App {
@@ -452,14 +488,42 @@ impl App {
         thread::spawn(move || {
             loop {
                 {
-                    let mut state = clone.lock().unwrap();
-                    state.handle_event(Event {
+                    let mut state = clone.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Err(e) = state.handle_event(Event {
                         payload: EventPayload::Update,
-                    });
+                    }) {
+                        eprintln!("update error: {e}");
+                    }
                 }
                 sleep(Duration::from_secs(1));
             }
         });
+    }
+    fn parse_command(line: &str) -> Result<EventPayload, String> {
+        let mut parts = line.split_whitespace();
+        let cmd = parts.next().ok_or("empty command")?;
+        let mut arg = || -> Result<usize, String> {
+            parts
+                .next()
+                .ok_or("missing argument")?
+                .parse::<usize>()
+                .map_err(|e| format!("bad number: {e}"))
+        };
+        Ok(match cmd {
+            "exit" => EventPayload::Exit,
+            "play" => EventPayload::PlaySong { id: arg()? },
+            "enqu" => EventPayload::Enqueue { id: arg()? },
+            "next" => EventPayload::NextSong,
+            "prev" => EventPayload::PreviousSong,
+            "vol" => EventPayload::SetVolume {
+                value: (arg()? as f32 / 100.0).clamp(0.0, 1.0),
+            },
+            "paus" => EventPayload::Pause,
+            "resu" => EventPayload::Unpause,
+            "shuf" => EventPayload::Shuffle,
+            "info" => EventPayload::GetTrackInfo,
+            other => return Err(format!("unknown command: {other}")),
+        })
     }
     fn run(&mut self) -> Result<(), Box<dyn Error>> {
         {
@@ -467,7 +531,7 @@ impl App {
             state.load_tracks()?;
             state.handle_event(Event {
                 payload: EventPayload::Shuffle,
-            });
+            })?;
         }
         let mut buffer = String::new();
 
@@ -475,19 +539,26 @@ impl App {
 
         loop {
             buffer.clear();
-            io::stdin()
-                .read_line(&mut buffer)
-                .expect("Failed to read line");
-            let input = buffer.trim().parse::<i32>().unwrap_or(0);
-            let event = match Event::from_input(input, &io::stdin(), &mut buffer) {
-                Some(evnt) => evnt,
-                None => continue,
-            };
-            {
-                let mut state = self.state.lock().unwrap();
-                if !state.handle_event(event) {
-                    break;
+            if io::stdin().read_line(&mut buffer)? == 0 {
+                break;
+            }
+            let line = buffer.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let payload = match Self::parse_command(line) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{e}");
+                    continue;
                 }
+            };
+            let result = self.state.lock().unwrap().handle_event(Event { payload });
+            match result {
+                Ok(Response::Exit) => break,
+                Ok(Response::TrackData { data }) => println!("{data:?}"),
+                Ok(Response::Empty) => {}
+                Err(e) => eprintln!("error: {e}"),
             }
         }
         Ok(())
