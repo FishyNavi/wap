@@ -2,11 +2,13 @@ use lofty::file::AudioFile;
 use lofty::file::TaggedFileExt;
 use lofty::read_from_path;
 use lofty::tag::Accessor;
+use rodio::source;
 use rodio::{Decoder, MixerDeviceSink, queue};
 use rusqlite::Connection;
 use rusqlite::params;
 use std::borrow::Cow;
 
+use rand::seq::SliceRandom;
 use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsStr;
@@ -14,85 +16,118 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::BufReader;
-
+use std::mem::take;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::{Arc, RwLock};
+use std::thread;
+use std::thread::sleep;
+use std::time::Duration;
 struct Queue {
-    queue: Arc<Vec<i32>>,
+    queue: Vec<usize>,
     position: Option<usize>,
     sink_handle: MixerDeviceSink,
-    track_list: HashMap<i32, TrackData>,
+    track_list: HashMap<usize, TrackData>,
     player: rodio::Player,
-    current_track: Option<Track>,
-    next_track: Option<Track>,
-    previous_track: Option<Track>,
+    next_id: Option<usize>,
 }
 impl Queue {
     fn new() -> Self {
-        // let current_track = Track::new(1, None).unwrap();
-        let current_track = None;
-        let queue: Arc<Vec<i32>> = Arc::new(Vec::new());
+        let next_id = None::<usize>;
+        let queue: Vec<usize> = Vec::new();
         let position = Some(0);
 
         let sink_handle =
             rodio::DeviceSinkBuilder::open_default_sink().expect("open default audio stream");
         let player = rodio::Player::connect_new(&sink_handle.mixer());
-        let track_list: HashMap<i32, TrackData> = HashMap::new();
+        let track_list: HashMap<usize, TrackData> = HashMap::new();
         Self {
             queue,
             position,
             sink_handle,
             track_list,
             player,
-            current_track,
-            next_track: None,
-            previous_track: None,
+            next_id,
         }
     }
-    fn enqueue(&mut self, id: i32) -> Result<(), Box<dyn Error>> {
+    fn shuffle(&mut self) -> Result<(), Box<dyn Error>> {
+        let mut ids: Vec<usize> = self.track_list.keys().copied().collect();
+        ids.shuffle(&mut rand::rng());
+        self.queue = ids;
         Ok(())
     }
-    fn play(&mut self, id: i32) -> Result<(), Box<dyn Error>> {
-        // if let Some(track) = self.current_track.as_mut() {
-        //     if track.id == id {
-        //         self.player.clear();
-        //     } else {
-        //         let track = self.track_from_id(id)?;
-        //         self.current_track = Some(track);
-        //     }
-        // } else {
-        //     let track = self.track_from_id(id)?;
-        //     self.current_track = Some(track);
-        // }
-        if self.current_track.is_some() {
-            println!(
-                "id {} track id {}",
-                id,
-                self.current_track.as_ref().unwrap().id
-            );
-        }
+    fn enqueue_next(&mut self) -> Result<(), Box<dyn Error>> {
+        let next = self.next_id.map_or(0, |p| p + 1);
+        self.next_id = Some(next);
 
-        let track = self.track_from_id(id)?;
-        self.current_track = Some(track);
+        if let Some(track) = self.queue.get(next) {
+            self.enqueue(*track)?;
+        };
 
-        if let Some(track) = self.current_track.as_mut() {
-            if let Some(source) = track.source.take() {
-                self.player.clear();
-                self.player.append(source);
-                self.player.play();
-            }
+        Ok(())
+    }
+    fn enqueue(&mut self, id: usize) -> Result<(), Box<dyn Error>> {
+        let track_data = self.track_from_id(id)?;
+        println!("{}", track_data.path);
+        if let Some(source) = TrackData::source_from_path(&track_data.path) {
+            self.player.append(source);
         }
 
         Ok(())
-        // self.player.append(self.current_track.source);
+    }
+
+    fn play_track(&mut self, id: usize) -> Result<(), Box<dyn Error>> {
+        self.position = Some(id as usize);
+
+        // println!(
+        //     "{:?} {:?} {:?}",
+        //     self.position,
+        //     self.player.len(),
+        //     self.track_list
+        // );
+        let (track_id, path) = {
+            let track_data = self.track_from_id(id)?;
+            (track_data.id, track_data.path.clone())
+        };
+
+        self.next_id = Some(track_id);
+
+        let mut source = TrackData::source_from_path(&path);
+        if let Some(source) = source.take() {
+            self.player.clear();
+            self.player.append(source);
+            self.player.play();
+        }
+
+        Ok(())
+    }
+    fn previous_track(&mut self) -> Result<(), Box<dyn Error>> {
+        let next = self
+            .position
+            .map_or(0, |p| if p == 0 { self.queue.len() - 1 } else { p - 1 });
+        if let Some(&id) = self.queue.get(next) {
+            self.position = Some(next);
+            self.play_track(id)
+        } else {
+            Ok(())
+        }
+    }
+    fn next_track(&mut self) -> Result<(), Box<dyn Error>> {
+        let next = self.position.map_or(0, |p| p + 1);
+        if let Some(&id) = self.queue.get(next) {
+            self.position = Some(next);
+            self.play_track(id)
+        } else {
+            Ok(())
+        }
     }
     fn handle_event(&mut self, payload: EventPayload) -> Result<(), Box<dyn Error>> {
         // if self.current_track.is_none() {
         //     return;
         // };
         match payload {
-            EventPayload::PlaySong { id } => self.play(id)?,
+            EventPayload::PlaySong { id } => self.play_track(id)?,
             EventPayload::ChangeVolume { value } => {
                 self.player
                     .set_volume((self.player.volume() + value).min(1.0).max(0.0));
@@ -104,45 +139,15 @@ impl Queue {
         }
         Ok(())
     }
-    fn set_track_list(&mut self, track_list: HashMap<i32, TrackData>) {
+    fn set_track_list(&mut self, track_list: HashMap<usize, TrackData>) {
         self.track_list = track_list;
-        println!("{:?}", self.track_list);
     }
-    fn track_from_id(&mut self, id: i32) -> Result<Track, &str> {
+    fn track_from_id(&mut self, id: usize) -> Result<&TrackData, &str> {
         let track_data = self
             .track_list
             .get(&id)
-            .map(|data| {
-                let source = Track::source_from_path(&data.path);
-                Track {
-                    id,
-                    source,
-                    data: Some(data.clone()),
-                }
-            })
             .ok_or("wap searched hard but didn't find any matching the id");
         track_data
-    }
-    // fn queue_track(track: ) {
-
-    // }
-    fn next_song(&mut self, forward: bool) -> Result<(), Box<dyn Error>> {
-        let next = self.position.map_or(0, |p| p + 1);
-        if let Some(&id) = self.queue.get(next) {
-            self.position = Some(next);
-            self.play(id)
-        } else {
-            Ok(())
-        }
-
-        // self.previous_track = self.current_track.take();
-        // self.current_track = self.next_track.take();
-        // let track = self.queue.get(self.position as usize).unwrap_or(&Track {
-        //     source: None,
-        //     data: None,
-        //     id: 0,
-        // });
-        // self.next_track = Some(self.track_from_id(track.id + 1)?);
     }
 }
 struct Resources {
@@ -191,23 +196,20 @@ impl Resources {
         )?;
 
         self.check_dir(dir)?;
-        println!("Populated the db with paths");
         self.parse_db()?;
-        println!("Db parsed!");
         Ok(())
     }
     fn parse_db(&mut self) -> rusqlite::Result<()> {
         let mut stmt = self.conn.prepare("SELECT id, path FROM db")?;
         let song_iter = stmt.query_map([], |row| {
             Ok(TrackData {
-                id: row.get(0)?,
+                id: row.get::<_, i32>(0)? as usize,
                 path: row.get(1)?,
                 tag: None,
             })
         })?;
         for song in song_iter {
             let song = song?;
-            println!("Found song {:?}", song);
             let path: String = song.path;
 
             match read_from_path(&path) {
@@ -245,13 +247,14 @@ impl Resources {
 
         Ok(())
     }
-    fn fetch_db(&mut self) -> Result<HashMap<i32, TrackData>, Box<dyn Error>> {
+    fn fetch_db(&mut self) -> Result<HashMap<usize, TrackData>, Box<dyn Error>> {
         let mut stmt = self
             .conn
             .prepare("SELECT id, path, title, artist, album, genre FROM db")?;
         let tags = stmt
             .query_map([], |row| {
-                let id = row.get(0)?;
+                let id_: i32 = row.get(0)?;
+                let id = id_ as usize;
                 Ok((
                     id,
                     TrackData {
@@ -267,7 +270,7 @@ impl Resources {
                 ))
             })
             .expect("No tag")
-            .collect::<Result<HashMap<i32, TrackData>, rusqlite::Error>>()?;
+            .collect::<Result<HashMap<usize, TrackData>, rusqlite::Error>>()?;
         Ok(tags)
     }
 }
@@ -290,28 +293,27 @@ impl TrackTag {
 }
 #[derive(Debug, Clone)]
 struct TrackData {
-    id: i32,
+    id: usize,
     path: String,
     tag: Option<TrackTag>,
 }
-struct Track {
-    source: Option<Decoder<BufReader<File>>>,
-    data: Option<TrackData>,
-    id: i32,
-}
-impl Track {
-    fn new(id: i32, data: TrackData) -> Option<Track> {
-        let source = Some(Decoder::try_from(File::open(data.path).unwrap()).unwrap());
+// struct Track {
+//     source: Option<Decoder<BufReader<File>>>,
+//     data: Option<TrackData>,
+//     id: usize,
+// }
+impl TrackData {
+    fn new(id: usize, path: String) -> Option<TrackData> {
         Some(Self {
-            source,
             id,
-            data: None,
+            path,
+            tag: None,
         })
     }
     fn source_from_path(path: &String) -> Option<Decoder<BufReader<File>>> {
         Some(Decoder::try_from(File::open(path).unwrap()).unwrap())
     }
-    // fn fetch_tag_from_db(id: i32, conn: &Connection) -> TrackTag {
+    // fn fetch_tag_from_db(id: usize, conn: &Connection) -> TrackTag {
     //     let track_tag = conn.query_row(
     //         "
     //             SELECT title, artist, album, genre FROM db WHERE id = ?1
@@ -331,37 +333,32 @@ impl Track {
 }
 
 struct Event {
-    queue_event: bool,
     payload: EventPayload,
     // id time etc
 }
 impl Event {
     fn from_input(input: i32, stdin: &io::Stdin, buffer: &mut String) -> Option<Self> {
-        let (queue_event, payload) = match input {
-            0 => (false, EventPayload::Exit),
+        let payload = match input {
+            0 => EventPayload::Exit,
             1 => {
                 buffer.clear();
                 if stdin.read_line(buffer).ok()? == 0 {
                     return None;
                 }
-                let id = buffer.trim().parse::<i32>().unwrap_or_else(|_| {
+                let id = buffer.trim().parse::<usize>().unwrap_or_else(|_| {
                     println!("Invalid id");
                     0
                 });
-                println!("meow");
-                (true, EventPayload::PlaySong { id })
+                EventPayload::PlaySong { id }
             }
-            2 => (true, EventPayload::NextSong { forward: true }),
-            3 => (true, EventPayload::ChangeVolume { value: 0.05 }),
-            4 => (true, EventPayload::ChangeVolume { value: -0.05 }),
-            5 => (true, EventPayload::Pause),
-            6 => (true, EventPayload::Unpause),
-            _ => (false, EventPayload::None),
+            2 => EventPayload::NextSong { forward: true },
+            3 => EventPayload::ChangeVolume { value: 0.05 },
+            4 => EventPayload::ChangeVolume { value: -0.05 },
+            5 => EventPayload::Pause,
+            6 => EventPayload::Unpause,
+            _ => EventPayload::None,
         };
-        Some(Self {
-            queue_event,
-            payload,
-        })
+        Some(Self { payload })
         // change it
     }
 }
@@ -371,7 +368,7 @@ enum EventPayload {
     Unpause,
     ChangeVolume { value: f32 },
     NextSong { forward: bool },
-    PlaySong { id: i32 },
+    PlaySong { id: usize },
     Exit,
     None, // temp ig
 }
@@ -395,13 +392,12 @@ impl State {
         }
     }
     fn handle_event(&mut self, event: Event) -> bool {
-        match (&event.queue_event, &event.payload) {
-            (true, _) => self
+        match &event.payload {
+            EventPayload::Exit => return false,
+            _ => self
                 .queue
                 .handle_event(event.payload)
                 .unwrap_or_else(|e| eprintln!("Error: {}", e)),
-            (false, EventPayload::Exit) => return false,
-            (_, _) => {}
         }
         true
     }
@@ -410,26 +406,44 @@ impl State {
         self.queue.set_track_list(tracks);
         Ok(())
     }
-    fn update(&mut self) -> Result<(), Box<dyn Error>> {
+    fn update(&mut self) {
         if self.queue.player.len() < 2 {
-            self.queue.next_song(true)
-        } else {
-            Ok(())
+            self.queue.enqueue_next();
         }
     }
 }
 struct App {
-    state: State,
+    state: Arc<Mutex<State>>,
 }
 impl App {
     fn new() -> Self {
-        let state = State::new();
+        let state = Arc::new(Mutex::new(State::new()));
 
         Self { state }
     }
+    fn poll(&self) {
+        let clone = Arc::clone(&self.state);
+
+        thread::spawn(move || {
+            loop {
+                {
+                    let mut state = clone.lock().unwrap();
+                    state.update();
+                }
+                sleep(Duration::from_secs(1));
+            }
+        });
+    }
     fn run(&mut self) -> Result<(), Box<dyn Error>> {
-        self.state.load_tracks()?;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.load_tracks()?;
+            state.queue.shuffle()?;
+        }
         let mut buffer = String::new();
+
+        self.poll();
+
         loop {
             buffer.clear();
             io::stdin()
@@ -440,8 +454,11 @@ impl App {
                 Some(evnt) => evnt,
                 None => continue,
             };
-            if !self.state.handle_event(event) {
-                break;
+            {
+                let mut state = self.state.lock().unwrap();
+                if !state.handle_event(event) {
+                    break;
+                }
             }
         }
         Ok(())
