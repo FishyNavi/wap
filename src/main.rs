@@ -44,8 +44,9 @@ struct Queue {
 }
 impl Queue {
     fn new() -> Result<Self, Box<dyn Error>> {
-        let sink_handle = rodio::DeviceSinkBuilder::open_default_sink()
+        let mut sink_handle = rodio::DeviceSinkBuilder::open_default_sink()
             .map_err(|e| format!("cannot open audio device: {e:?}"))?;
+        sink_handle.log_on_drop(false);
         let player = rodio::Player::connect_new(&sink_handle.mixer());
         player.pause();
 
