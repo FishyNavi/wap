@@ -24,6 +24,12 @@ use std::sync::Mutex;
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
+#[derive(PartialEq)]
+enum QueueModes {
+    OnRepeat,
+    Shuffle,
+}
+
 struct Queue {
     queue: Vec<usize>,
     in_player: VecDeque<usize>,
@@ -32,6 +38,7 @@ struct Queue {
     track_list: HashMap<usize, TrackData>,
     player: rodio::Player,
     next_id: usize,
+    queue_mode: QueueModes,
 }
 impl Queue {
     fn new() -> Self {
@@ -42,6 +49,7 @@ impl Queue {
         let sink_handle =
             rodio::DeviceSinkBuilder::open_default_sink().expect("open default audio stream");
         let player = rodio::Player::connect_new(&sink_handle.mixer());
+        player.pause();
         let track_list: HashMap<usize, TrackData> = HashMap::new();
         Self {
             queue,
@@ -50,6 +58,7 @@ impl Queue {
             track_list,
             player,
             next_id,
+            queue_mode: QueueModes::Shuffle,
         }
     }
     fn open(&self, track_id: usize) -> Result<Decoder<BufReader<File>>, Box<dyn Error>> {
@@ -66,9 +75,6 @@ impl Queue {
             .get(self.in_player.front().ok_or("id not found")?)
             .cloned()
             .ok_or("not such id")?)
-    }
-    fn position(&self) -> Option<usize> {
-        self.in_player.front().copied()
     }
     fn shuffle(&mut self) {
         let mut ids: Vec<usize> = self.track_list.keys().copied().collect();
@@ -102,6 +108,7 @@ impl Queue {
     fn index_of(&self, track_id: usize) -> Option<usize> {
         self.queue.iter().position(|&t| t == track_id)
     }
+
     fn play_id(&mut self, track_id: usize) -> Result<(), Box<dyn Error>> {
         // println!(
         //     "{:?} {:?} {:?}",
@@ -156,7 +163,12 @@ impl Queue {
         let len = self.queue.len();
         if len == 0 {
             return Err("queue is empty".into());
+        } else if self.player.len() > 1 && forward {
+            self.player.skip_one();
+            self.in_player.pop_front();
+            return Ok(());
         }
+
         let cur = self
             .in_player
             .front()
@@ -187,6 +199,7 @@ impl Queue {
             EventPayload::NextSong => self.next_track(true)?,
             EventPayload::PreviousSong => self.next_track(false)?,
             EventPayload::Shuffle => self.shuffle(),
+            EventPayload::ChangeQueueMode { mode } => self.queue_mode = mode,
             _ => {}
         }
         Ok(())
@@ -198,6 +211,16 @@ impl Queue {
         while self.in_player.len() > self.player.len() {
             self.in_player.pop_front();
         }
+        if self.player.len() >= 2 {
+            return;
+        }
+        if let Some(cur) = self.in_player.front() {
+            if let Some(d) = self.track_list.get(cur).and_then(|t| t.duration) {
+                if d.saturating_sub(self.player.get_pos()) > Duration::from_millis(200) {
+                    return;
+                }
+            }
+        }
         let mut failures = 0;
         while self.player.len() < 2 && failures < self.queue.len() {
             if self.next_id >= self.queue.len() {
@@ -208,6 +231,9 @@ impl Queue {
             if let Err(e) = self.enqueue(track_id) {
                 eprintln!("skipping track {track_id}: {e}");
                 failures += 1;
+            }
+            if self.queue_mode == QueueModes::OnRepeat {
+                self.next_id -= 1;
             }
         }
     }
@@ -250,6 +276,7 @@ impl Resources {
             CREATE TABLE IF NOT EXISTS db (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 path TEXT NOT NULL,
+                duration INTEGER,
                 title TEXT,
                 artist TEXT,
                 album TEXT,
@@ -270,6 +297,7 @@ impl Resources {
                 id: row.get::<_, i32>(0)? as usize,
                 path: row.get(1)?,
                 tag: None,
+                duration: None,
             })
         })?;
         for song in song_iter {
@@ -281,7 +309,7 @@ impl Resources {
                     // for item in tagged_file.primary_tag().unwrap().items() {
                     //     println!("{:?}", item)
                     // }
-                    let duration = tagged_file.properties().duration();
+                    let duration = tagged_file.properties().duration().as_millis() as i64;
                     let bitrate = tagged_file.properties().audio_bitrate();
                     if let Some(tag) = tagged_file.primary_tag() {
                         let title = tag
@@ -297,8 +325,8 @@ impl Resources {
                             .genre()
                             .unwrap_or_else(|| Cow::Borrowed("Unknown Genre"));
                         self.conn.execute(
-                            "UPDATE db SET title = ?1, artist = ?2, album = ?3, genre = ?4 WHERE path = ?5 ",
-                            params![title, artist, album, genre, &path],
+                            "UPDATE db SET duration = ?1, title = ?2, artist = ?3, album = ?4, genre = ?5 WHERE path = ?6 ",
+                            params![duration, title, artist, album, genre, &path],
                         )?;
                         // TODO: add more tags
 
@@ -316,21 +344,23 @@ impl Resources {
     fn fetch_db(&mut self) -> Result<HashMap<usize, TrackData>, Box<dyn Error>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, path, COALESCE(title,'Unknown Title'), COALESCE(artist,'Unknown Artist'), COALESCE(album,'Unknown Album'), COALESCE(genre,'Unknown Genre') FROM db")?;
+            .prepare("SELECT id, path, duration, COALESCE(title,'Unknown Title'), COALESCE(artist,'Unknown Artist'), COALESCE(album,'Unknown Album'), COALESCE(genre,'Unknown Genre') FROM db")?;
         let tags = stmt
             .query_map([], |row| {
                 let id_: i32 = row.get(0)?;
                 let id = id_ as usize;
+                let duration: Option<i64> = row.get(2)?;
                 Ok((
                     id,
                     TrackData {
                         id: id,
                         path: row.get(1)?,
+                        duration: duration.map(|ms| Duration::from_millis(ms as u64)),
                         tag: Some(TrackTag {
-                            title: row.get(2)?,
-                            artist: row.get(3)?,
-                            album: row.get(4)?,
-                            genre: row.get(5)?,
+                            title: row.get(3)?,
+                            artist: row.get(4)?,
+                            album: row.get(5)?,
+                            genre: row.get(6)?,
                         }),
                     },
                 ))
@@ -360,6 +390,7 @@ impl TrackTag {
 struct TrackData {
     id: usize,
     path: String,
+    duration: Option<Duration>,
     tag: Option<TrackTag>,
 }
 // struct Track {
@@ -368,13 +399,6 @@ struct TrackData {
 //     id: usize,
 // }
 impl TrackData {
-    fn new(id: usize, path: String) -> Option<TrackData> {
-        Some(Self {
-            id,
-            path,
-            tag: None,
-        })
-    }
     // fn fetch_tag_from_db(id: usize, conn: &Connection) -> TrackTag {
     //     let track_tag = conn.query_row(
     //         "
@@ -428,6 +452,7 @@ enum EventPayload {
     PreviousSong,
     PlaySong { id: usize },
     GetTrackInfo,
+    ChangeQueueMode { mode: QueueModes },
     Exit,
     None, // temp ig
 }
@@ -495,7 +520,7 @@ impl App {
                         eprintln!("update error: {e}");
                     }
                 }
-                sleep(Duration::from_secs(1));
+                sleep(Duration::from_millis(100)); // maybe change
             }
         });
     }
@@ -522,6 +547,13 @@ impl App {
             "resu" => EventPayload::Unpause,
             "shuf" => EventPayload::Shuffle,
             "info" => EventPayload::GetTrackInfo,
+            "mode" => EventPayload::ChangeQueueMode {
+                mode: if arg()? == 0 {
+                    QueueModes::Shuffle
+                } else {
+                    QueueModes::OnRepeat
+                },
+            },
             other => return Err(format!("unknown command: {other}")),
         })
     }
@@ -564,7 +596,7 @@ impl App {
         Ok(())
     }
 }
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
     let mut app = App::new();
-    app.run();
+    app.run()
 }
