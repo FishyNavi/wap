@@ -7,5 +7,5 @@ edition = "2024"
 lofty = "0.25.5"
 rand = "0.10.3"
 ratatui = "0.30.2"
-rodio = "0.23.0"
+rodio = {version = "0.23.0",  features = ["symphonia-all"]}
 rusqlite = { version = "0.41.1", features = ["bundled"] }

@@ -275,7 +275,7 @@ struct Resources {
     conn: Connection,
     skipped: usize,
 }
-
+const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "ogg", "oga", "opus", "wav", "m4a", "aac"];
 impl Resources {
     fn new() -> Result<Self, Box<dyn Error>> {
         Ok(Self {
@@ -283,24 +283,33 @@ impl Resources {
             skipped: 0,
         })
     }
-    fn ext(path: &PathBuf) -> Option<&str> {
-        path.extension().and_then(OsStr::to_str)
+    // fn ext(path: &PathBuf) -> Option<&str> {
+    //     path.extension().and_then(OsStr::to_str)
+    // }
+
+    fn is_audio(path: &Path) -> bool {
+        path.extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|e| AUDIO_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
     }
+
     fn check_dir(&mut self, dir: &Path) -> Result<(), Box<dyn Error>> {
         // fix this maybe
         for entry in fs::read_dir(dir)? {
-            let entry = entry?;
+            let Ok(entry) = entry else {
+                self.skipped += 1;
+                continue;
+            };
+            let path = entry.path();
             if entry.path().is_dir() {
-                Self::check_dir(self, &entry.path())?;
-            } else {
-                let path = entry.path();
-
-                if matches!(Self::ext(&path), Some("mp3")) {
-                    self.conn.execute(
-                        "INSERT INTO db (path) VALUES (?1)",
-                        params![path.display().to_string()],
-                    )?;
-                }
+                if self.check_dir(&entry.path()).is_err() {
+                    self.skipped += 1;
+                };
+            } else if Self::is_audio(&path) {
+                self.conn.execute(
+                    "INSERT INTO db (path) VALUES (?1)",
+                    params![path.display().to_string()],
+                )?;
             }
         }
         Ok(())
