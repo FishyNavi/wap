@@ -6,9 +6,9 @@ use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
 use std::time::Duration;
+use std::usize;
 
 use crate::types::OnRepeat;
-use crate::types::OnRepeat::No;
 use crate::types::{EventPayload, Status, TrackData};
 pub struct Queue {
     pub queue: Vec<usize>,
@@ -178,8 +178,11 @@ impl Queue {
         let id = if forward {
             self.queue.get(self.next_idx).ok_or("next_track broke 1")?
         } else {
-            self.next_idx = self.previous_idx();
-
+            self.next_idx = if self.player.get_pos() >= Duration::from_secs(3) {
+                self.previous_idx()
+            } else {
+                self.current_idx
+            };
             self.queue.get(self.next_idx).ok_or("next_track broke 2")?
         };
         self.play_id(*id)?;
@@ -221,6 +224,31 @@ impl Queue {
     }
     pub fn set_track_list(&mut self, track_list: HashMap<usize, TrackData>) {
         self.track_list = track_list;
+    }
+    pub fn search(&self, keyword: &str) -> Vec<usize> {
+        use rust_fuzzy_search::fuzzy_search_threshold;
+        // Remove the '*' from the beginning of the expression
+        let tracks: Vec<String> = self
+            .track_list
+            .iter()
+            .map(|(id, data)| {
+                let tag = data.tag.clone().unwrap_or_default();
+                format!("[{}] {} {} {}", id, tag.title, tag.artist, tag.album)
+            })
+            .collect();
+        let list: Vec<&str> = tracks.iter().map(|s| s.as_str()).collect();
+
+        let res = fuzzy_search_threshold(&keyword, &list, 0.8);
+
+        res.iter()
+            .filter_map(|(val, _)| {
+                val.split_whitespace()
+                    .next()?
+                    .trim_matches(|c| c == '[' || c == ']')
+                    .parse::<usize>()
+                    .ok()
+            })
+            .collect()
     }
 }
 

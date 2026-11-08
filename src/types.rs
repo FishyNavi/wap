@@ -35,6 +35,16 @@ pub struct TrackTag {
     pub album: String,
     pub genre: String,
 }
+impl Default for TrackTag {
+    fn default() -> Self {
+        Self {
+            title: "Unknown Title".to_string(),
+            artist: "Unknown Artist".to_string(),
+            album: "".to_string(),
+            genre: "".to_string(),
+        }
+    }
+}
 #[derive(Debug, Clone, Copy)]
 pub struct Status {
     pub current: Option<usize>,
