@@ -17,8 +17,9 @@ pub enum EventPayload {
     Enqueue { id: usize },
     PlayNext { id: usize },
     Shuffle,
+    Unshuffle,
     TogglePause,
-    ChangeVolume { value: f32 },
+    ChangeVolume { value: f32 }, //change allofdat
     SetVolume { value: f32 },
     NextSong,
     PreviousSong,
@@ -28,6 +29,8 @@ pub enum EventPayload {
     Exit,
     ReachedEnd,
     TracksLoaded { tracks: HashMap<usize, TrackData> },
+    FuzzySearch(String),
+    GetQueue,
 }
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -77,10 +80,13 @@ pub enum Response {
     Empty,
     UpdateLibrary,
     Exit,
-    // TrackData { data: TrackData },
+    SearchResults,
+    QueueUpdate, // TrackData { data: TrackData },
 }
 pub enum UiMessage {
     Library(Vec<TrackData>),
+    SearchResults(Vec<TrackData>),
+    QueueUpdate(Vec<usize>),
     Status(Status),
     Notice(String),
     Fatal(String),

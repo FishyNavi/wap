@@ -9,6 +9,7 @@ use std::time::Duration;
 use std::usize;
 
 use crate::types::OnRepeat;
+use crate::types::Response;
 use crate::types::{EventPayload, Status, TrackData};
 pub struct Queue {
     pub queue: Vec<usize>,
@@ -211,7 +212,7 @@ impl Queue {
             self.current_idx - 1
         }
     }
-    pub fn handle_event(&mut self, payload: EventPayload) -> Result<(), Box<dyn Error>> {
+    pub fn handle_event(&mut self, payload: EventPayload) -> Result<Response, Box<dyn Error>> {
         match payload {
             EventPayload::PlaySong { id } => self.play_id(id)?,
             EventPayload::ChangeVolume { value } => {
@@ -234,18 +235,32 @@ impl Queue {
             EventPayload::PlayNext { id } => self.play_next(id),
             EventPayload::NextSong => self.next_track(true)?,
             EventPayload::PreviousSong => self.next_track(false)?,
-            EventPayload::Shuffle => self.shuffle(),
+            EventPayload::Shuffle => {
+                self.shuffle = true;
+                self.shuffle();
+                return Ok(Response::QueueUpdate);
+            }
+            EventPayload::Unshuffle => {
+                self.shuffle = false;
+                let mut ids: Vec<usize> = self.track_list.keys().copied().collect();
+                ids.sort();
+                self.queue = ids;
+                self.next_idx = if self.queue.len() > 1 { 1 } else { 0 };
+
+                return Ok(Response::QueueUpdate);
+            }
             EventPayload::ChangeRepeatMode { mode } => self.on_repeat = mode,
             EventPayload::ReachedEnd => self.player.pause(),
+
             _ => {}
         }
-        Ok(())
+        Ok(Response::Empty)
     }
     pub fn set_track_list(&mut self, track_list: HashMap<usize, TrackData>) {
         self.track_list = track_list;
         self.shuffle();
     }
-    pub fn fuzzy_search(&self, keyword: &str, fuzzy: bool) -> Vec<usize> {
+    pub fn fuzzy_search(&self, keyword: &str, fuzzy: bool) -> Vec<TrackData> {
         if fuzzy {
             use rust_fuzzy_search::fuzzy_search_threshold;
 
@@ -263,11 +278,13 @@ impl Queue {
 
             res.iter()
                 .filter_map(|(val, _)| {
-                    val.split_whitespace()
+                    let id = val
+                        .split_whitespace()
                         .next()?
                         .trim_matches(|c| c == '[' || c == ']')
                         .parse::<usize>()
-                        .ok()
+                        .ok()?;
+                    self.track_list.get(&id).cloned()
                 })
                 .collect()
         } else {
@@ -278,7 +295,11 @@ impl Queue {
                 .filter_map(|(id, data)| {
                     let tag = data.tag.as_ref()?;
                     let matches = tag.title.to_lowercase().contains(&keyword); // add matching for title, album and genre separately
-                    if matches { Some((*id)) } else { None }
+                    if matches {
+                        self.track_list.get(&id).cloned()
+                    } else {
+                        None
+                    }
                 })
                 .collect()
         }

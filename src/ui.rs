@@ -25,16 +25,27 @@ fn label(t: &TrackData) -> String {
             .to_string(),
     }
 }
-
+#[derive(PartialEq)]
+enum ViewMode {
+    List,
+    Queue,
+    Search,
+}
 pub struct Ui {
     pub tx: Sender<Event>,
     rx: Receiver<UiMessage>,
     library: Vec<TrackData>,
     status: Status,
     list: ListState,
+    search_list: ListState,
+    queue_list: ListState,
+    queue: Vec<usize>,
     message: Option<String>,
     pub fatal: Option<String>,
     running: bool,
+    view_mode: ViewMode,
+    search_query: String,
+    search_results: Vec<TrackData>,
 }
 
 impl Ui {
@@ -49,12 +60,18 @@ impl Ui {
                 paused: true,
                 volume: 1.0,
                 on_repeat: OnRepeat::Yes,
-                shuffle: true,
+                shuffle: false,
             },
             list: ListState::default(),
+            search_list: ListState::default(),
+            queue_list: ListState::default(),
+            queue: vec![],
             message: Some("Scanning library…".into()),
             fatal: None,
             running: true,
+            view_mode: ViewMode::List,
+            search_query: "".to_string(),
+            search_results: vec![],
         }
     }
 
@@ -88,6 +105,8 @@ impl Ui {
                     self.fatal = Some(m);
                     self.running = false;
                 }
+                Ok(UiMessage::SearchResults(r)) => self.search_results = r,
+                Ok(UiMessage::QueueUpdate(q)) => self.queue = q,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.running = false;
@@ -104,6 +123,32 @@ impl Ui {
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        if self.view_mode == ViewMode::Search {
+            match code {
+                KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => self.quit(),
+                KeyCode::Backspace => {
+                    self.search_query.pop();
+                }
+                KeyCode::Enter => {
+                    if self.search_query.len() == 0 {
+                        self.search_results.clear();
+                    } else {
+                        self.send(EventPayload::FuzzySearch(self.search_query.clone()));
+                    }
+                }
+                KeyCode::Char(c) => self.search_query.push(c),
+                KeyCode::Tab => {
+                    self.view_mode = match self.view_mode {
+                        ViewMode::List => ViewMode::Queue,
+                        ViewMode::Queue => ViewMode::Search,
+                        ViewMode::Search => ViewMode::List,
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         self.message = None;
         let selected = self
             .list
@@ -116,6 +161,14 @@ impl Ui {
             KeyCode::Char('q') | KeyCode::Esc => self.quit(),
             KeyCode::Up | KeyCode::Char('k') => self.list.select_previous(),
             KeyCode::Down | KeyCode::Char('j') => self.list.select_next(),
+            KeyCode::Tab => {
+                self.view_mode = match self.view_mode {
+                    ViewMode::List => ViewMode::Queue,
+                    ViewMode::Queue => ViewMode::Search,
+                    ViewMode::Search => ViewMode::List,
+                }
+            }
+            KeyCode::Char('/') => self.view_mode = ViewMode::Search,
             KeyCode::Enter => {
                 if let Some(id) = selected {
                     self.send(EventPayload::PlaySong { id });
@@ -126,6 +179,11 @@ impl Ui {
                     self.send(EventPayload::Enqueue { id });
                 }
             }
+            KeyCode::Char('m') => {
+                if let Some(id) = selected {
+                    self.send(EventPayload::PlayNext { id });
+                }
+            }
             KeyCode::Char(' ') => self.send(EventPayload::TogglePause),
             KeyCode::Char('n') => self.send(EventPayload::NextSong),
             KeyCode::Char('p') => self.send(EventPayload::PreviousSong),
@@ -133,7 +191,13 @@ impl Ui {
                 self.send(EventPayload::ChangeVolume { value: 0.05 })
             }
             KeyCode::Char('-') => self.send(EventPayload::ChangeVolume { value: -0.05 }),
-            KeyCode::Char('s') => self.send(EventPayload::Shuffle),
+            KeyCode::Char('s') => {
+                if !self.status.shuffle {
+                    self.send(EventPayload::Shuffle);
+                } else {
+                    self.send(EventPayload::Unshuffle);
+                }
+            }
             KeyCode::Char('r') => {
                 let mode = match self.status.on_repeat {
                     OnRepeat::Yes => OnRepeat::Single,
@@ -150,7 +214,25 @@ impl Ui {
         self.send(EventPayload::Exit);
         self.running = false;
     }
-
+    fn format_list_item(t: &TrackData, current: Option<usize>) -> ListItem {
+        let playing = Some(t.id) == current;
+        let dur = t.duration.map_or("--:--".to_string(), fmt_dur);
+        let style = if playing {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        ListItem::new(format!(
+            "{} {:>4}  {}  [{}]",
+            if playing { "▶" } else { " " },
+            t.id,
+            label(t),
+            dur
+        ))
+        .style(style)
+    }
     fn draw(&mut self, f: &mut Frame) {
         let [list_area, now_area, help_area] = Layout::vertical([
             Constraint::Min(3),
@@ -158,34 +240,42 @@ impl Ui {
             Constraint::Length(1),
         ])
         .areas(f.area());
-
-        let items: Vec<ListItem> = self
-            .library
-            .iter()
-            .map(|t| {
-                let playing = Some(t.id) == self.status.current;
-                let dur = t.duration.map_or("--:--".to_string(), fmt_dur);
-                let style = if playing {
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                ListItem::new(format!(
-                    "{} {:>4}  {}  [{}]",
-                    if playing { "▶" } else { " " },
-                    t.id,
-                    label(t),
-                    dur
-                ))
-                .style(style)
-            })
-            .collect();
+        let items: Vec<ListItem> = match self.view_mode {
+            ViewMode::Queue => self
+                .queue
+                .iter()
+                .filter_map(|&id| self.library.iter().find(|t| t.id == id))
+                .map(|t| Self::format_list_item(t, self.status.current))
+                .collect(),
+            ViewMode::Search => self
+                .search_results
+                .iter()
+                .map(|t| Self::format_list_item(t, self.status.current))
+                .collect(),
+            ViewMode::List => self
+                .library
+                .iter()
+                .map(|t| Self::format_list_item(t, self.status.current))
+                .collect(),
+        };
+        let title = match self.view_mode {
+            ViewMode::Search => format!(
+                "Searching: [{}] | Results ({})",
+                self.search_query,
+                self.search_results.len()
+            ),
+            ViewMode::Queue => format!("Queue: ({})", self.queue.len()),
+            ViewMode::List => format!("Library: ({})", self.library.len()),
+        };
+        let list_state = match self.view_mode {
+            ViewMode::Queue => &mut self.queue_list,
+            ViewMode::Search => &mut self.search_list,
+            ViewMode::List => &mut self.list,
+        };
         let list = List::new(items)
-            .block(Block::bordered().title(format!(" Library ({}) ", self.library.len())))
+            .block(Block::bordered().title(title))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-        f.render_stateful_widget(list, list_area, &mut self.list);
+        f.render_stateful_widget(list, list_area, list_state);
 
         let block = Block::bordered().title(" Now playing ");
         let inner = block.inner(now_area);
@@ -208,9 +298,13 @@ impl Ui {
             OnRepeat::No => "",
             OnRepeat::Single => "repeat single",
         };
+        let shuffle = match self.status.shuffle {
+            true => "shuffle",
+            false => "",
+        };
         f.render_widget(
             Paragraph::new(format!(
-                "{icon} {name}    vol {}%   {mode}",
+                "{icon} {name}    vol {}%   {mode} {shuffle}",
                 (self.status.volume * 100.0).round() as u32
             )),
             info,

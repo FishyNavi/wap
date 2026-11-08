@@ -8,12 +8,17 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 struct State {
     queue: Queue,
     resources: Resources,
+    search_results: Vec<TrackData>,
 }
 impl State {
     fn new() -> Result<Self, Box<dyn Error>> {
         let queue = Queue::new()?;
         let resources = Resources::new(Path::new("music.db"))?;
-        Ok(Self { queue, resources })
+        Ok(Self {
+            queue,
+            resources,
+            search_results: vec![],
+        })
     }
 
     fn handle_event(&mut self, event: Event) -> Result<Response, Box<dyn Error>> {
@@ -23,9 +28,12 @@ impl State {
                 self.queue.set_track_list(tracks.clone());
                 return Ok(Response::UpdateLibrary);
             }
-            other => self.queue.handle_event(other)?,
+            EventPayload::FuzzySearch(keyword) => {
+                self.search_results = self.queue.fuzzy_search(keyword.as_str(), true);
+                return Ok(Response::SearchResults);
+            }
+            other => return Ok(self.queue.handle_event(other)?),
         }
-        Ok(Response::Empty)
     }
 
     fn load_tracks(&mut self) -> Result<(), Box<dyn Error>> {
@@ -71,15 +79,18 @@ pub fn backend_main(dir: PathBuf, ui_rx: Receiver<Event>, tx: Sender<UiMessage>)
     let bg_tx = event_tx.clone();
 
     std::thread::spawn(move || {
-        if let Ok(mut resources) = Resources::new(Path::new("music.db")) {
-            if resources.index(&bg_dir).is_ok() {
-                if let Ok(tracks) = resources.fetch_db() {
-                    let _ = bg_tx.send(Event {
-                        payload: EventPayload::TracksLoaded { tracks },
-                    });
+        let update_dur = std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(mut resources) = Resources::new(Path::new("music.db")) {
+                if resources.index(&bg_dir).is_ok() {
+                    if let Ok(tracks) = resources.fetch_db() {
+                        let _ = bg_tx.send(Event {
+                            payload: EventPayload::TracksLoaded { tracks },
+                        });
+                    }
                 }
             }
-        } else {
+            std::thread::sleep(update_dur);
         }
     });
     if state.resources.skipped > 0 {
@@ -96,6 +107,16 @@ pub fn backend_main(dir: PathBuf, ui_rx: Receiver<Event>, tx: Sender<UiMessage>)
                     let library: Vec<TrackData> =
                         state.queue.track_list.values().cloned().collect();
                     if !send(UiMessage::Library(library)) {
+                        return;
+                    }
+                }
+                Ok(Response::SearchResults) => {
+                    if !send(UiMessage::SearchResults(state.search_results.clone())) {
+                        return;
+                    }
+                }
+                Ok(Response::QueueUpdate) => {
+                    if !send(UiMessage::QueueUpdate(state.queue.queue.clone())) {
                         return;
                     }
                 }
