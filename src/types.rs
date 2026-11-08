@@ -1,10 +1,11 @@
 use std::time::Duration;
-
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum QueueModes {
-    OnRepeat,
-    Shuffle,
+pub enum OnRepeat {
+    No,
+    Yes,
+    Single,
 }
+
 pub struct Event {
     pub payload: EventPayload,
     // id time etc
@@ -22,8 +23,9 @@ pub enum EventPayload {
     PreviousSong,
     PlaySong { id: usize },
     GetTrackInfo,
-    ChangeQueueMode { mode: QueueModes },
+    ChangeRepeatMode { mode: OnRepeat },
     Exit,
+    ReachedEnd,
 }
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -39,7 +41,8 @@ pub struct Status {
     pub position: Duration,
     pub paused: bool,
     pub volume: f32,
-    pub mode: QueueModes,
+    pub on_repeat: OnRepeat,
+    pub shuffle: bool,
 }
 // impl TrackTag {
 //     fn new(title: String, artist: String, album: String, genre: String) -> Self {

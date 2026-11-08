@@ -7,18 +7,20 @@ use std::fs::File;
 use std::io::BufReader;
 use std::time::Duration;
 
-use crate::types::{EventPayload, QueueModes, Status, TrackData};
+use crate::types::OnRepeat;
+use crate::types::OnRepeat::No;
+use crate::types::{EventPayload, Status, TrackData};
 pub struct Queue {
     pub queue: Vec<usize>,
     pub user_queue: VecDeque<usize>,
-    pub history: Vec<usize>,
     pub current_idx: usize,
     #[allow(unused)]
     pub sink_handle: MixerDeviceSink,
     pub track_list: HashMap<usize, TrackData>,
     pub player: rodio::Player,
     pub next_idx: usize,
-    pub queue_mode: QueueModes,
+    pub on_repeat: OnRepeat,
+    pub shuffle: bool,
     pub warnings: Vec<String>,
 }
 pub const TICK: Duration = Duration::from_millis(100);
@@ -33,13 +35,13 @@ impl Queue {
         Ok(Self {
             queue: Vec::new(),
             user_queue: VecDeque::new(),
-            history: Vec::new(),
             current_idx: 0,
             sink_handle,
             track_list: HashMap::new(),
             player,
             next_idx: 0,
-            queue_mode: QueueModes::Shuffle,
+            on_repeat: OnRepeat::Yes,
+            shuffle: true,
             warnings: Vec::new(),
         })
     }
@@ -57,7 +59,8 @@ impl Queue {
             position: self.player.get_pos(),
             paused: self.player.is_paused(),
             volume: self.player.volume(),
-            mode: self.queue_mode,
+            on_repeat: self.on_repeat,
+            shuffle: self.shuffle,
         }
     }
     pub fn take_warnings(&mut self) -> Vec<String> {
@@ -69,9 +72,6 @@ impl Queue {
         self.player.clear();
         self.player.append(source);
         self.player.play();
-        if self.player.len() >= 0 {
-            println!("skipped idk"); // temp
-        }
         Ok(())
     }
 
@@ -98,21 +98,13 @@ impl Queue {
     fn skip(&mut self) {
         self.user_queue.pop_front();
     }
-    fn index_of(&self, track_id: usize) -> Option<usize> {
-        self.queue.iter().position(|&t| t == track_id)
-    }
+    // fn index_of(&self, track_id: usize) -> Option<usize> {
+    //     self.queue.iter().position(|&t| t == track_id)
+    // }
 
     fn play_id(&mut self, track_id: usize) -> Result<(), Box<dyn Error>> {
         let source = self.open(track_id)?;
-        let idx = match self.index_of(track_id) {
-            Some(i) => i,
-            None => {
-                self.queue.push(track_id);
-                self.queue.len() - 1
-            }
-        };
         self.player.clear();
-
         self.update_next_idx();
         self.player.append(source);
         self.player.play();
@@ -122,16 +114,18 @@ impl Queue {
         self.current_idx = self.next_idx;
         let len = self.queue.len();
         self.next_idx = if self.next_idx >= len {
+            let _ = self.handle_event(EventPayload::ReachedEnd);
             0
         } else {
             self.next_idx + 1
         };
     }
+
     fn step(&mut self) -> Result<(), Box<dyn Error>> {
-        let idx = match self.queue_mode {
-            QueueModes::OnRepeat => self.current_idx,
-            _ => self.next_idx,
-        };
+        // let idx = match self.on_repeat {
+        //     OnRepeat::Single => self.current_idx,
+        //     _ => self.current_idx,
+        // };
         let source = if self.user_queue.len() > 0 {
             let id = self
                 .user_queue
@@ -143,11 +137,18 @@ impl Queue {
             if len == 0 {
                 return Err("queue is empty".into());
             }
-            let src = self.open(idx)?;
-            self.update_next_idx();
+            println!("{}", self.current_idx);
+            if !(self.on_repeat == OnRepeat::Single) {}
+            match self.on_repeat {
+                OnRepeat::Single => {}
+                _ => self.update_next_idx(),
+            }
+            let src = self.open(self.queue[self.current_idx])?;
+
             src
         };
         self.player.append(source);
+        self.player.play();
         Ok(())
     }
     pub fn update(&mut self) -> Result<(), Box<dyn Error>> {
@@ -171,11 +172,27 @@ impl Queue {
             return Ok(self.play_from_user_queue()?);
         }
         if self.next_idx >= self.queue.len() {
-            self.update_next_idx();
+            self.next_idx = 0;
         }
-        let id = self.queue.get(self.next_idx).unwrap();
+
+        let id = if forward {
+            self.queue.get(self.next_idx).ok_or("next_track broke 1")?
+        } else {
+            self.next_idx = self.previous_idx();
+
+            self.queue.get(self.next_idx).ok_or("next_track broke 2")?
+        };
         self.play_id(*id)?;
+
         Ok(())
+    }
+    fn previous_idx(&mut self) -> usize {
+        let len = self.queue.len() - 1;
+        if self.current_idx == 0 {
+            len
+        } else {
+            self.current_idx - 1
+        }
     }
     pub fn handle_event(&mut self, payload: EventPayload) -> Result<(), Box<dyn Error>> {
         match payload {
@@ -196,7 +213,8 @@ impl Queue {
             EventPayload::NextSong => self.next_track(true)?,
             EventPayload::PreviousSong => self.next_track(false)?,
             EventPayload::Shuffle => self.shuffle(),
-            EventPayload::ChangeQueueMode { mode } => self.queue_mode = mode,
+            EventPayload::ChangeRepeatMode { mode } => self.on_repeat = mode,
+            EventPayload::ReachedEnd => self.player.pause(),
             _ => {}
         }
         Ok(())

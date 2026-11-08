@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
-use crate::types::{Event, EventPayload, QueueModes, Status, TrackData, UiMessage};
+use crate::types::{Event, EventPayload, OnRepeat, Status, TrackData, UiMessage};
 
 fn fmt_dur(d: Duration) -> String {
     format!("{}:{:02}", d.as_secs() / 60, d.as_secs() % 60)
@@ -48,7 +48,8 @@ impl Ui {
                 position: Duration::ZERO,
                 paused: true,
                 volume: 1.0,
-                mode: QueueModes::Shuffle,
+                on_repeat: OnRepeat::Yes,
+                shuffle: true,
             },
             list: ListState::default(),
             message: Some("Scanning library…".into()),
@@ -134,11 +135,12 @@ impl Ui {
             KeyCode::Char('-') => self.send(EventPayload::ChangeVolume { value: -0.05 }),
             KeyCode::Char('s') => self.send(EventPayload::Shuffle),
             KeyCode::Char('r') => {
-                let mode = match self.status.mode {
-                    QueueModes::Shuffle => QueueModes::OnRepeat,
-                    QueueModes::OnRepeat => QueueModes::Shuffle,
+                let mode = match self.status.on_repeat {
+                    OnRepeat::Yes => OnRepeat::Single,
+                    OnRepeat::Single => OnRepeat::No,
+                    OnRepeat::No => OnRepeat::Yes,
                 };
-                self.send(EventPayload::ChangeQueueMode { mode });
+                self.send(EventPayload::ChangeRepeatMode { mode });
             }
             _ => {}
         }
@@ -201,9 +203,10 @@ impl Ui {
             (_, true) => "⏸",
             (_, false) => "▶",
         };
-        let mode = match self.status.mode {
-            QueueModes::Shuffle => "shuffle",
-            QueueModes::OnRepeat => "repeat",
+        let mode = match self.status.on_repeat {
+            OnRepeat::Yes => "repeat",
+            OnRepeat::No => "",
+            OnRepeat::Single => "repeat single",
         };
         f.render_widget(
             Paragraph::new(format!(
