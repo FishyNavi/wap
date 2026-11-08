@@ -225,30 +225,43 @@ impl Queue {
     pub fn set_track_list(&mut self, track_list: HashMap<usize, TrackData>) {
         self.track_list = track_list;
     }
-    pub fn search(&self, keyword: &str) -> Vec<usize> {
-        use rust_fuzzy_search::fuzzy_search_threshold;
-        // Remove the '*' from the beginning of the expression
-        let tracks: Vec<String> = self
-            .track_list
-            .iter()
-            .map(|(id, data)| {
-                let tag = data.tag.clone().unwrap_or_default();
-                format!("[{}] {} {} {}", id, tag.title, tag.artist, tag.album)
-            })
-            .collect();
-        let list: Vec<&str> = tracks.iter().map(|s| s.as_str()).collect();
+    pub fn fuzzy_search(&self, keyword: &str, fuzzy: bool) -> Vec<usize> {
+        if fuzzy {
+            use rust_fuzzy_search::fuzzy_search_threshold;
 
-        let res = fuzzy_search_threshold(&keyword, &list, 0.8);
+            let tracks: Vec<String> = self
+                .track_list
+                .iter()
+                .map(|(id, data)| {
+                    let tag = data.tag.clone().unwrap_or_default();
+                    format!("[{}] {} {} {}", id, tag.title, tag.artist, tag.album)
+                })
+                .collect();
+            let list: Vec<&str> = tracks.iter().map(|s| s.as_str()).collect();
 
-        res.iter()
-            .filter_map(|(val, _)| {
-                val.split_whitespace()
-                    .next()?
-                    .trim_matches(|c| c == '[' || c == ']')
-                    .parse::<usize>()
-                    .ok()
-            })
-            .collect()
+            let res = fuzzy_search_threshold(&keyword, &list, 0.8);
+
+            res.iter()
+                .filter_map(|(val, _)| {
+                    val.split_whitespace()
+                        .next()?
+                        .trim_matches(|c| c == '[' || c == ']')
+                        .parse::<usize>()
+                        .ok()
+                })
+                .collect()
+        } else {
+            let keyword = keyword.to_lowercase();
+
+            self.track_list
+                .iter()
+                .filter_map(|(id, data)| {
+                    let tag = data.tag.as_ref()?;
+                    let matches = tag.title.to_lowercase().contains(&keyword); // add matching for title, album and genre separately
+                    if matches { Some((*id)) } else { None }
+                })
+                .collect()
+        }
     }
 }
 
