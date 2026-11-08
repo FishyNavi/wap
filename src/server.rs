@@ -1,5 +1,5 @@
 use crate::player::{Queue, TICK};
-use crate::resources::Resources;
+use crate::resources::{self, Resources};
 use crate::types::{Event, EventPayload, Response, TrackData, UiMessage};
 
 use std::error::Error;
@@ -10,17 +10,19 @@ struct State {
     resources: Resources,
 }
 impl State {
-    fn new(dir: &Path) -> Result<Self, Box<dyn Error>> {
+    fn new() -> Result<Self, Box<dyn Error>> {
         let queue = Queue::new()?;
-        let mut resources = Resources::new(Path::new("."))?;
-        resources.index(dir)?;
+        let resources = Resources::new(Path::new("music.db"))?;
         Ok(Self { queue, resources })
     }
 
     fn handle_event(&mut self, event: Event) -> Result<Response, Box<dyn Error>> {
         match event.payload {
             EventPayload::Exit => return Ok(Response::Exit),
-            EventPayload::Update => self.queue.update()?,
+            EventPayload::TracksLoaded { tracks } => {
+                self.queue.set_track_list(tracks.clone());
+                return Ok(Response::UpdateLibrary);
+            }
             other => self.queue.handle_event(other)?,
         }
         Ok(Response::Empty)
@@ -33,9 +35,9 @@ impl State {
     }
 }
 
-pub fn backend_main(dir: PathBuf, rx: Receiver<Event>, tx: Sender<UiMessage>) {
+pub fn backend_main(dir: PathBuf, ui_rx: Receiver<Event>, tx: Sender<UiMessage>) {
     let init = || -> Result<State, Box<dyn Error>> {
-        let mut state = State::new(&dir)?;
+        let mut state = State::new()?;
         state.load_tracks()?;
         state.queue.shuffle();
         Ok(state)
@@ -54,6 +56,32 @@ pub fn backend_main(dir: PathBuf, rx: Receiver<Event>, tx: Sender<UiMessage>) {
     if !send(UiMessage::Library(library)) {
         return;
     }
+
+    let (event_tx, rx) = std::sync::mpsc::channel();
+    let fwd_tx = event_tx.clone();
+
+    std::thread::spawn(move || {
+        while let Ok(event) = ui_rx.recv() {
+            if fwd_tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    let bg_dir = dir.clone();
+    let bg_tx = event_tx.clone();
+
+    std::thread::spawn(move || {
+        if let Ok(mut resources) = Resources::new(Path::new("music.db")) {
+            if resources.index(&bg_dir).is_ok() {
+                if let Ok(tracks) = resources.fetch_db() {
+                    let _ = bg_tx.send(Event {
+                        payload: EventPayload::TracksLoaded { tracks },
+                    });
+                }
+            }
+        } else {
+        }
+    });
     if state.resources.skipped > 0 {
         let n = state.resources.skipped;
         send(UiMessage::Notice(format!("{n} file(s) could not be read")));
@@ -64,6 +92,13 @@ pub fn backend_main(dir: PathBuf, rx: Receiver<Event>, tx: Sender<UiMessage>) {
             Ok(event) => match state.handle_event(event) {
                 Ok(Response::Exit) => break,
                 Ok(Response::Empty) => {}
+                Ok(Response::UpdateLibrary) => {
+                    let library: Vec<TrackData> =
+                        state.queue.track_list.values().cloned().collect();
+                    if !send(UiMessage::Library(library)) {
+                        return;
+                    }
+                }
                 Err(e) => {
                     if !send(UiMessage::Notice(e.to_string())) {
                         break;

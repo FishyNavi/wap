@@ -22,7 +22,7 @@ impl Resources {
         //     conn: Connection::open(db_path)?,
         //     skipped: 0,
         // })
-        let conn = Connection::open_in_memory()?;
+        let conn = Connection::open(db_path)?;
 
         conn.execute(
             "

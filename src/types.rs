@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OnRepeat {
     No,
@@ -15,6 +15,7 @@ pub struct Event {
 pub enum EventPayload {
     Update,
     Enqueue { id: usize },
+    PlayNext { id: usize },
     Shuffle,
     TogglePause,
     ChangeVolume { value: f32 },
@@ -26,6 +27,7 @@ pub enum EventPayload {
     ChangeRepeatMode { mode: OnRepeat },
     Exit,
     ReachedEnd,
+    TracksLoaded { tracks: HashMap<usize, TrackData> },
 }
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -73,6 +75,7 @@ pub struct TrackData {
 }
 pub enum Response {
     Empty,
+    UpdateLibrary,
     Exit,
     // TrackData { data: TrackData },
 }

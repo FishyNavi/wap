@@ -230,7 +230,8 @@ impl Queue {
                     self.player.pause();
                 }
             }
-            EventPayload::Enqueue { id } => self.play_next(id),
+            EventPayload::Enqueue { id } => self.enqueue(id),
+            EventPayload::PlayNext { id } => self.play_next(id),
             EventPayload::NextSong => self.next_track(true)?,
             EventPayload::PreviousSong => self.next_track(false)?,
             EventPayload::Shuffle => self.shuffle(),
@@ -242,6 +243,7 @@ impl Queue {
     }
     pub fn set_track_list(&mut self, track_list: HashMap<usize, TrackData>) {
         self.track_list = track_list;
+        self.shuffle();
     }
     pub fn fuzzy_search(&self, keyword: &str, fuzzy: bool) -> Vec<usize> {
         if fuzzy {
