@@ -1,28 +1,44 @@
-permissions:
-  contents: write
-name: Rust
+name: Rust Release
 
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  build-and-release:
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
-    - name: Dependencies
+
+    - name: Set up Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache dependencies
+      uses: swatinem/rust-cache@v2
+
+    - name: Install dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y libasound2-dev pkg-config
-    - name: Build
-      run: cargo build --verbose
+
     - name: Run tests
       run: cargo test --verbose
+
+    - name: Build Release Binary
+      run: cargo build --release --verbose
+
+    - name: Release and Upload Asset
+      uses: softprops/action-gh-release@v2
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        files: target/release/wap
