@@ -13,6 +13,7 @@ use crate::types::{EventPayload, Status, TrackData};
 pub struct Queue {
     pub queue: Vec<usize>,
     pub user_queue: VecDeque<usize>,
+    pub current_id: Option<usize>,
     pub current_idx: usize,
     #[allow(unused)]
     pub sink_handle: MixerDeviceSink,
@@ -35,6 +36,7 @@ impl Queue {
         Ok(Self {
             queue: Vec::new(),
             user_queue: VecDeque::new(),
+            current_id: None,
             current_idx: 0,
             sink_handle,
             track_list: HashMap::new(),
@@ -55,7 +57,7 @@ impl Queue {
     }
     pub fn status(&self) -> Status {
         Status {
-            current: self.user_queue.front().copied(),
+            current: self.current_id,
             position: self.player.get_pos(),
             paused: self.player.is_paused(),
             volume: self.player.volume(),
@@ -68,6 +70,7 @@ impl Queue {
     }
     fn play_from_user_queue(&mut self) -> Result<(), Box<dyn Error>> {
         let id = self.user_queue.pop_front().ok_or("No such id")?;
+        self.current_id = Some(id);
         let source = self.open(id)?;
         self.player.clear();
         self.player.append(source);
@@ -86,7 +89,7 @@ impl Queue {
         let mut ids: Vec<usize> = self.track_list.keys().copied().collect();
         ids.shuffle(&mut rand::rng());
         self.queue = ids;
-        self.next_idx = 1;
+        self.next_idx = if self.queue.len() > 1 { 1 } else { 0 };
         self.current_idx = 0;
     }
     fn play_next(&mut self, id: usize) {
@@ -98,27 +101,36 @@ impl Queue {
     fn skip(&mut self) {
         self.user_queue.pop_front();
     }
-    // fn index_of(&self, track_id: usize) -> Option<usize> {
-    //     self.queue.iter().position(|&t| t == track_id)
-    // }
+    fn index_of(&self, track_id: usize) -> Option<usize> {
+        self.queue.iter().position(|&t| t == track_id)
+    }
 
     fn play_id(&mut self, track_id: usize) -> Result<(), Box<dyn Error>> {
         let source = self.open(track_id)?;
         self.player.clear();
-        self.update_next_idx();
+        self.current_idx = self.index_of(track_id).unwrap_or(self.current_idx);
+        self.current_id = Some(track_id);
         self.player.append(source);
         self.player.play();
         Ok(())
     }
     fn update_next_idx(&mut self) {
-        self.current_idx = self.next_idx;
         let len = self.queue.len();
-        self.next_idx = if self.next_idx >= len {
-            let _ = self.handle_event(EventPayload::ReachedEnd);
-            0
-        } else {
-            self.next_idx + 1
-        };
+        if len == 0 {
+            self.current_idx = 0;
+            self.next_idx = 0;
+            return;
+        }
+
+        self.current_idx = self.next_idx;
+        if self.current_idx >= len {
+            if self.on_repeat == OnRepeat::No {
+                let _ = self.handle_event(EventPayload::ReachedEnd);
+            }
+            self.current_idx = 0;
+        }
+
+        self.next_idx = (self.current_idx + 1) % len;
     }
 
     fn step(&mut self) -> Result<(), Box<dyn Error>> {
@@ -126,41 +138,42 @@ impl Queue {
         //     OnRepeat::Single => self.current_idx,
         //     _ => self.current_idx,
         // };
-        let source = if self.user_queue.len() > 0 {
-            let id = self
-                .user_queue
+
+        let track_id = if self.user_queue.len() > 0 {
+            self.user_queue
                 .pop_front()
-                .ok_or("yeah uh something broke")?;
-            self.open(id)?
+                .ok_or("yeah uh something broke")?
         } else {
             let len = self.queue.len();
             if len == 0 {
                 return Err("queue is empty".into());
             }
-            println!("{}", self.current_idx);
-            if !(self.on_repeat == OnRepeat::Single) {}
             match self.on_repeat {
                 OnRepeat::Single => {}
                 _ => self.update_next_idx(),
             }
-            let src = self.open(self.queue[self.current_idx])?;
-
-            src
+            *self
+                .queue
+                .get(self.current_idx)
+                .ok_or("queue index out of bounds")?
         };
-        self.player.append(source);
+        self.current_id = Some(track_id);
+        let src = self.open(track_id)?;
+        self.player.append(src);
         self.player.play();
         Ok(())
     }
     pub fn update(&mut self) -> Result<(), Box<dyn Error>> {
-        if let Some(d) = self
-            .track_list
-            .get(&self.current_idx)
-            .and_then(|t| t.duration)
-        {
-            if d.saturating_sub(self.player.get_pos()) < TICK {
-                self.step()?;
+        if self.player.len() < 2 {
+            if let Some(id) = self.current_id {
+                if let Some(d) = self.track_list.get(&id).and_then(|t| t.duration) {
+                    if d.saturating_sub(self.player.get_pos()) < TICK {
+                        self.step()?;
+                    }
+                }
             }
         }
+
         Ok(())
     }
     fn next_track(&mut self, forward: bool) -> Result<(), Box<dyn Error>> {
@@ -178,15 +191,16 @@ impl Queue {
         let id = if forward {
             self.queue.get(self.next_idx).ok_or("next_track broke 1")?
         } else {
-            self.next_idx = if self.player.get_pos() >= Duration::from_secs(3) {
+            self.next_idx = if self.player.get_pos() <= Duration::from_secs(3) {
                 self.previous_idx()
             } else {
                 self.current_idx
             };
             self.queue.get(self.next_idx).ok_or("next_track broke 2")?
         };
-        self.play_id(*id)?;
 
+        self.play_id(*id)?;
+        self.update_next_idx();
         Ok(())
     }
     fn previous_idx(&mut self) -> usize {
@@ -207,9 +221,13 @@ impl Queue {
             EventPayload::SetVolume { value } => self.player.set_volume(value),
             EventPayload::TogglePause => {
                 if self.player.is_paused() {
-                    self.player.play()
+                    if self.player.len() > 0 {
+                        self.player.play();
+                    } else {
+                        self.play_id(1)?;
+                    }
                 } else {
-                    self.player.pause()
+                    self.player.pause();
                 }
             }
             EventPayload::Enqueue { id } => self.play_next(id),

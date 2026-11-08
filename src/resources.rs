@@ -3,11 +3,11 @@ use lofty::read_from_path;
 use lofty::tag::Accessor;
 use rusqlite::{Connection, params};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::types::{TrackData, TrackTag};
@@ -22,45 +22,9 @@ impl Resources {
         //     conn: Connection::open(db_path)?,
         //     skipped: 0,
         // })
-        Ok(Self {
-            conn: Connection::open_in_memory()?,
-            skipped: 0,
-        })
-    }
-    // fn ext(path: &PathBuf) -> Option<&str> {
-    //     path.extension().and_then(OsStr::to_str)
-    // }
+        let conn = Connection::open_in_memory()?;
 
-    fn is_audio(path: &Path) -> bool {
-        path.extension()
-            .and_then(OsStr::to_str)
-            .is_some_and(|e| AUDIO_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
-    }
-
-    fn check_dir(&mut self, dir: &Path) -> Result<(), Box<dyn Error>> {
-        // fix this maybe. delete entries with path outside of scanned dir
-        for entry in fs::read_dir(dir)? {
-            let Ok(entry) = entry else {
-                self.skipped += 1;
-                continue;
-            };
-            let path = entry.path();
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                if self.check_dir(&entry.path()).is_err() {
-                    self.skipped += 1;
-                };
-            } else if Self::is_audio(&path) {
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO db (path) VALUES (?1)",
-                    params![path.display().to_string()],
-                )?;
-            }
-        }
-        Ok(())
-    }
-    pub fn index(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
-        let dir = fs::canonicalize(path)?;
-        self.conn.execute(
+        conn.execute(
             "
             CREATE TABLE IF NOT EXISTS db (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,76 +39,118 @@ impl Resources {
             ",
             [],
         )?;
-
-        self.conn.execute_batch("BEGIN")?;
-        let scanned = self.check_dir(dir.as_path());
-        scanned.and(self.conn.execute_batch("COMMIT").map_err(Into::into));
-        self.parse_db()?;
-        Ok(())
+        Ok(Self { conn, skipped: 0 })
     }
-    fn parse_db(&mut self) -> rusqlite::Result<()> {
-        let rows: Vec<(i64, String, Option<i64>)> = {
-            let mut stmt = self.conn.prepare("SELECT id, path, modified FROM db")?;
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                .collect::<Result<_, _>>()?
-        };
+    // fn ext(path: &PathBuf) -> Option<&str> {
+    //     path.extension().and_then(OsStr::to_str)
+    // }
 
+    fn is_audio(path: &Path) -> bool {
+        path.extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|e| AUDIO_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+    }
+    fn check_dir(dir: &Path, out: &mut Vec<PathBuf>, skipped: &mut usize) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            *skipped += 1;
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => Self::check_dir(&path, out, skipped),
+                Ok(_) if Resources::is_audio(&path) => out.push(path),
+                _ => {}
+            }
+        }
+    }
+    // fn check_dir(&mut self, dir: &Path) {
+    //     // fix this maybe. delete entries with path outside of scanned dir
+    //     for entry in fs::read_dir(dir)? {
+    //         let Ok(entry) = entry else {
+    //             self.skipped += 1;
+    //             continue;
+    //         };
+    //         let path = entry.path();
+    //         if entry.file_type().is_ok_and(|t| t.is_dir()) {
+    //             if self.check_dir(&entry.path()) {
+    //                 self.skipped += 1;
+    //             };
+    //         } else if Self::is_audio(&path) {
+    //             self.conn.execute(
+    //                 "INSERT OR IGNORE INTO db (path) VALUES (?1)",
+    //                 params![path.display().to_string()],
+    //             );
+    //         }
+    //     }
+    // }
+    pub fn index(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
+        let dir = fs::canonicalize(path)?;
+
+        let mut files = Vec::new();
+        let mut skipped = 0;
+        Self::check_dir(dir.as_path(), &mut files, &mut skipped);
+        let known = Self::get_known(&self.conn)?;
+        let mut seen = HashSet::new();
         let db_tx = self.conn.transaction()?;
-        for (id, path, modified) in rows {
-            let current = match fs::metadata(&path).and_then(|m| m.modified()) {
-                Ok(t) => t
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64,
-                Err(_) => {
-                    db_tx.execute("DELETE FROM db WHERE id = ?1", params![id])?;
-                    continue;
-                }
+        for p in &files {
+            let path = p.display().to_string();
+            seen.insert(path.clone());
+
+            let Ok(mtime) = fs::metadata(&path).and_then(|m| m.modified()) else {
+                skipped += 1;
+                continue;
             };
-            if modified == Some(current) {
+            let mtime = mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            if known.get(&path).and_then(|k| k.1) == Some(mtime) {
                 continue;
             }
             match read_from_path(&path) {
-                Ok(tagged_file) => {
-                    // for item in tagged_file.primary_tag().unwrap().items() {
-                    //     println!("{:?}", item)
-                    // }
-                    let duration = tagged_file.properties().duration().as_millis() as i64; // handle 0 durations
+                Ok(file) => {
+                    let duration = file.properties().duration().as_millis() as i64;
+                    let tag = file.primary_tag();
+                    let title = tag
+                        .and_then(|t| t.title())
+                        .unwrap_or(Cow::Borrowed("Unknown Title"));
+                    let artist = tag
+                        .and_then(|t| t.artist())
+                        .unwrap_or(Cow::Borrowed("Unknown Artist"));
+                    let album = tag
+                        .and_then(|t| t.album())
+                        .unwrap_or(Cow::Borrowed("Unknown Album"));
+                    let genre = tag
+                        .and_then(|t| t.genre())
+                        .unwrap_or(Cow::Borrowed("Unknown Genre"));
                     db_tx.execute(
-                        "UPDATE db SET duration = ?1 WHERE path = ?2",
-                        params![duration, path],
+                        "INSERT INTO db (path, duration, title, artist, album, genre, modified)
+                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                            ON CONFLICT(path) DO UPDATE SET
+                                duration = excluded.duration, title = excluded.title,
+                                artist = excluded.artist, album = excluded.album,
+                                genre = excluded.genre, modified = excluded.modified",
+                        params![path, duration, title, artist, album, genre, mtime],
                     )?;
-
-                    // let bitrate = tagged_file.properties().audio_bitrate();
-                    if let Some(tag) = tagged_file.primary_tag() {
-                        let title = tag
-                            .title()
-                            .unwrap_or_else(|| Cow::Borrowed("Unknown Title"));
-                        let artist = tag
-                            .artist()
-                            .unwrap_or_else(|| Cow::Borrowed("Unknown Artist"));
-                        let album = tag
-                            .album()
-                            .unwrap_or_else(|| Cow::Borrowed("Unknown Album"));
-                        let genre = tag
-                            .genre()
-                            .unwrap_or_else(|| Cow::Borrowed("Unknown Genre"));
-                        db_tx.execute(
-                            "UPDATE db SET duration = ?1, title = ?2, artist = ?3, album = ?4, genre = ?5 WHERE path = ?6 ",
-                            params![duration, title, artist, album, genre, &path],
-                        )?;
-                        // TODO: add more tags
-
-                        // println!("{} {} {} {}", title, artist, album, genre)
-                    }
                 }
-                Err(_) => {
-                    self.skipped += 1;
-                }
+                Err(_) => skipped += 1,
             }
         }
+        for (path, (id, _)) in &known {
+            if Path::new(path).starts_with(&dir) && !seen.contains(path) {
+                db_tx.execute("DELETE FROM db WHERE id = ?1", params![id])?;
+            }
+        }
+
         db_tx.commit()?;
+        self.skipped += skipped;
         Ok(())
+    }
+    fn get_known(conn: &Connection) -> rusqlite::Result<HashMap<String, (i64, Option<i64>)>> {
+        let mut stmt = conn.prepare("SELECT path, id, modified FROM db")?;
+        stmt.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
+            .collect::<Result<_, _>>()
     }
     pub fn fetch_db(&mut self) -> Result<HashMap<usize, TrackData>, Box<dyn Error>> {
         let mut stmt = self
