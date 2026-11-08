@@ -12,7 +12,7 @@ struct State {
 impl State {
     fn new(dir: &Path) -> Result<Self, Box<dyn Error>> {
         let queue = Queue::new()?;
-        let mut resources = Resources::new()?;
+        let mut resources = Resources::new(Path::new("."))?;
         resources.index(dir)?;
         Ok(Self { queue, resources })
     }
